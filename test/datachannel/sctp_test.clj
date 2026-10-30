@@ -225,3 +225,31 @@
       (.put corrupted-buf 12 (unchecked-byte (inc orig-byte)))
       (.position corrupted-buf 0)
       (is (nil? (sctp/decode-packet corrupted-buf))))))
+
+(deftest forward-tsn-chunk-and-process-test
+  (let [fwd-chunk {:type :forward-tsn
+                   :new-cumulative-tsn 42
+                   :streams [{:stream-id 1 :stream-sequence 7}]}
+        packet {:src-port 5000
+                :dst-port 5000
+                :verification-tag 999
+                :chunks [fwd-chunk]}
+        decoded (round-trip packet)
+        decoded-chunk (first (:chunks decoded))]
+    (is (= :forward-tsn (:type decoded-chunk)))
+    (is (= 42 (:new-cumulative-tsn decoded-chunk)))
+    (is (= [{:stream-id 1 :stream-sequence 7}] (:streams decoded-chunk)))
+    ;; Also verify chunks/process-chunk advances :remote-tsn and drains contiguous out-of-order TSNs
+    (require 'datachannel.chunks)
+    (let [process-chunk (resolve 'datachannel.chunks/process-chunk)
+          state {:remote-tsn 40
+                 :out-of-order-tsns (sorted-set 41 43 44)
+                 :streams {1 {:next-ssn 5 :recv-queue [{:tsn 41 :seq-num 6} {:tsn 43 :seq-num 8}]}}
+                 :pending-control-chunks []}
+          {:keys [next-state]} (process-chunk state decoded-chunk packet 1000)]
+      (is (= 44 (:remote-tsn next-state)))
+      (is (empty? (:out-of-order-tsns next-state)))
+      (is (= 8 (get-in next-state [:streams 1 :next-ssn])))
+      (is (= [{:tsn 43 :seq-num 8}] (get-in next-state [:streams 1 :recv-queue])))
+      (is (= :sack (:type (first (:pending-control-chunks next-state)))))
+      (is (= 44 (:cum-tsn-ack (first (:pending-control-chunks next-state))))))))

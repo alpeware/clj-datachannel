@@ -407,6 +407,58 @@
   (let [s1 (assoc state :state :closed)]
     {:next-state s1 :next-events [{:type :on-close}]}))
 
+(defmethod process-chunk :forward-tsn [state chunk _packet _now-ms]
+  (let [new-cum-tsn (:new-cumulative-tsn chunk)
+        remote-tsn (get state :remote-tsn -1)
+        ooo-tsns (get state :out-of-order-tsns (sorted-set))
+        diff (unchecked-int (unchecked-subtract (unchecked-int new-cum-tsn) (unchecked-int remote-tsn)))
+        is-newer? (or (= remote-tsn -1) (pos? diff))]
+    (if-not is-newer?
+      (let [sack-chunk {:type :sack
+                        :cum-tsn-ack remote-tsn
+                        :a-rwnd 100000
+                        :gap-blocks (compute-gap-blocks remote-tsn ooo-tsns)
+                        :duplicate-tsns []}]
+        {:next-state (-> state
+                         (update :pending-control-chunks conj sack-chunk)
+                         (update :timers dissoc :sctp/t-delayed-sack)
+                         (assoc :unacked-data-chunks 0))
+         :next-events []})
+      (let [;; Remove any out-of-order TSNs <= new-cum-tsn and advance through contiguous TSNs
+            pruned-ooo (into (sorted-set)
+                             (filter #(pos? (unchecked-int (unchecked-subtract (unchecked-int %) (unchecked-int new-cum-tsn))))
+                                     ooo-tsns))
+            s1 (loop [curr-tsn new-cum-tsn
+                      curr-ooo pruned-ooo]
+                 (let [next-tsn (if (= curr-tsn 4294967295) 0 (inc curr-tsn))]
+                   (if (contains? curr-ooo next-tsn)
+                     (recur next-tsn (disj curr-ooo next-tsn))
+                     (assoc state :remote-tsn curr-tsn :out-of-order-tsns curr-ooo))))
+            ;; Advance stream sequence numbers and prune abandoned chunks from receive queues
+            s2 (reduce (fn [st {:keys [stream-id stream-sequence]}]
+                         (let [cur-ssn (get-in st [:streams stream-id :next-ssn] 0)
+                               target-ssn (bit-and (inc stream-sequence) 0xffff)
+                               ssn-diff (unchecked-short (unchecked-subtract (unchecked-short target-ssn) (unchecked-short cur-ssn)))
+                               new-ssn (if (pos? ssn-diff) target-ssn cur-ssn)
+                               recv-q (get-in st [:streams stream-id :recv-queue] [])
+                               new-recv-q (vec (filter #(pos? (unchecked-int (unchecked-subtract (unchecked-int (:tsn %)) (unchecked-int new-cum-tsn))))
+                                                       recv-q))]
+                           (-> st
+                               (assoc-in [:streams stream-id :next-ssn] new-ssn)
+                               (assoc-in [:streams stream-id :recv-queue] new-recv-q))))
+                       s1
+                       (:streams chunk []))
+            sack-chunk {:type :sack
+                        :cum-tsn-ack (:remote-tsn s2)
+                        :a-rwnd 100000
+                        :gap-blocks (compute-gap-blocks (:remote-tsn s2) (:out-of-order-tsns s2))
+                        :duplicate-tsns []}]
+        {:next-state (-> s2
+                         (update :pending-control-chunks conj sack-chunk)
+                         (update :timers dissoc :sctp/t-delayed-sack)
+                         (assoc :unacked-data-chunks 0))
+         :next-events []}))))
+
 (defmethod process-chunk :default [state chunk _packet _now-ms]
   (let [type-val (:type chunk)]
     (if (number? type-val)

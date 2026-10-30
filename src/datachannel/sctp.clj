@@ -458,8 +458,8 @@
         type-key (:type chunk)
         type-code (if (keyword? type-key) (get chunk-types type-key) type-key)
         flags (:flags chunk 0)]
-    (.put buf (byte type-code))
-    (.put buf (byte flags))
+    (.put buf (unchecked-byte type-code))
+    (.put buf (unchecked-byte flags))
     (.putShort buf 0)
 
     (encode-chunk-payload type-key buf chunk)

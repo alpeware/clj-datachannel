@@ -178,7 +178,7 @@
               magic-bytes (.array cookie-bytes)
               decoded-addr (byte-array 4)]
           (dotimes [i 4]
-            (aset decoded-addr i (byte (bit-xor (aget addr-bytes i) (aget magic-bytes i)))))
+            (aset decoded-addr i (unchecked-byte (bit-xor (aget addr-bytes i) (aget magic-bytes i)))))
           {:family family :port xport :address (java.net.InetAddress/getByAddress decoded-addr)}))
       (throw (ex-info "Only IPv4 supported for now" {:family family})))))
 
@@ -267,7 +267,7 @@
           magic-bytes (.array cookie-bytes)
           xor-addr (byte-array 4)]
       (dotimes [i 4]
-        (aset xor-addr i (byte (bit-xor (aget addr-bytes i) (aget magic-bytes i)))))
+        (aset xor-addr i (unchecked-byte (bit-xor (aget addr-bytes i) (aget magic-bytes i)))))
       (.put resp-buf xor-addr))
 
     ;; MESSAGE-INTEGRITY

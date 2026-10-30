@@ -181,9 +181,21 @@
                   SSLEngineResult$Status/CLOSED
                   (throw (Exception. "SSLEngine closed during handshake"))
                   (recur (inc loops))))
-              {:status hs-status
-               :packets (vec packets)
-               :app-data (.toByteArray app-data-out)})
+              (if (and (zero? loops) (.isEmpty packets))
+                (do
+                  (.clear out)
+                  (let [res (.wrap engine empty-app-buffer out)]
+                    (.flip out)
+                    (when (> (.remaining out) 0)
+                      (.add packets (buffer->bytes out)))
+                    (if (= (.getStatus res) SSLEngineResult$Status/CLOSED)
+                      (throw (Exception. "SSLEngine closed during handshake"))
+                      {:status (.getHandshakeStatus engine)
+                       :packets (vec packets)
+                       :app-data (.toByteArray app-data-out)})))
+                {:status hs-status
+                 :packets (vec packets)
+                 :app-data (.toByteArray app-data-out)}))
 
             SSLEngineResult$HandshakeStatus/NEED_UNWRAP_AGAIN
             (let [temp-app (make-buffer)
