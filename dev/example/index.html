@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>datachannel-clj WebRTC Demo</title>
+    <title>clj-datachannel WebRTC Demo</title>
     <style>
         body { font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; text-align: center; background: #f9f9f9; }
         h1 { color: #333; }
@@ -41,7 +41,7 @@
                 iceServers: [] // Local connection doesn't need external STUN
             });
 
-            // The datachannel-clj implementation does not perform in-band negotiation
+            // The clj-datachannel implementation does not perform in-band negotiation
             // for the default channel, so we set negotiated: true to match its behavior.
             log("Creating new DataChannel (id: 0, negotiated: true)...");
             const dc = pc.createDataChannel("test-channel");

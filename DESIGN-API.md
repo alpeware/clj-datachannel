@@ -1,6 +1,6 @@
 # API Redesign (Strict Sans-IO Architecture)
 
-This document details the architectural refactor of the `datachannel-clj` public API to enforce a strict "Sans-IO" paradigm. The primary goals are to remove all imperative callbacks, eliminate atom-mutations within the core state machine, and officially adopt a "Bring Your Own Loop" pattern.
+This document details the architectural refactor of the `clj-datachannel` public API to enforce a strict "Sans-IO" paradigm. The primary goals are to remove all imperative callbacks, eliminate atom-mutations within the core state machine, and officially adopt a "Bring Your Own Loop" pattern.
 
 ## Critical Architectural Constraints
 

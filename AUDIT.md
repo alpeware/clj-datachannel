@@ -1,5 +1,5 @@
 # Comprehensive Security Audit Report
-**Target:** `alpeware-datachannel-clj` (Pure Clojure WebRTC Data Channel Implementation)
+**Target:** `alpeware-clj-datachannel` (Pure Clojure WebRTC Data Channel Implementation)
 **Auditor:** Principal Protocol Architect & Security Engineer
 **Date:** March 17, 2026
 
@@ -7,7 +7,7 @@
 
 ## 1. Executive Summary
 
-A comprehensive security, architecture, and protocol compliance audit was performed on the `alpeware-datachannel-clj` codebase. The library utilizes a pure "Sans-IO" state machine design, which is highly commendable for producing deterministic, testable, and thread-safe logic. By abstracting away concurrency and threading from the core protocol logic, the architecture inherently prevents entire classes of race conditions.
+A comprehensive security, architecture, and protocol compliance audit was performed on the `alpeware-clj-datachannel` codebase. The library utilizes a pure "Sans-IO" state machine design, which is highly commendable for producing deterministic, testable, and thread-safe logic. By abstracting away concurrency and threading from the core protocol logic, the architecture inherently prevents entire classes of race conditions.
 
 However, the audit revealed **several Critical and High-severity vulnerabilities** at the boundaries where the pure state machine interacts with the physical network (the outer NIO Shell), as well as significant deviations from RFC specifications. 
 
@@ -172,7 +172,7 @@ Serialize the Transmission Control Block (TCB) state and a timestamp, sign it wi
 
 ## 4. Conclusion & Recommended Action Plan
 
-The `alpeware-datachannel-clj` codebase is structurally excellent, leveraging functional programming to elegantly avoid classic concurrency state mutations. However, the outer-boundary integration and protocol handshake phases require immediate hardening.
+The `alpeware-clj-datachannel` codebase is structurally excellent, leveraging functional programming to elegantly avoid classic concurrency state mutations. However, the outer-boundary integration and protocol handshake phases require immediate hardening.
 
 **Immediate Priority Action Items:**
 1. **Harden the API Loop:** Relocate the `try/catch` inside the `while @running` loop in `api.clj`. Add bounds checking to `dcep.clj` to prevent `BufferUnderflowException` crashes.

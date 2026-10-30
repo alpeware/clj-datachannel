@@ -1,4 +1,4 @@
-# Agent Instructions for datachannel-clj
+# Agent Instructions for clj-datachannel
 
 ## Environment Setup
 

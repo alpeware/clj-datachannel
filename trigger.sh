@@ -44,7 +44,7 @@ PROMPT_CONTENT=$(cat prompt.txt)
 # Use jq to safely construct the JSON payload and escape all newlines/quotes in the prompt
 JSON_PAYLOAD=$(jq -n --arg prompt "$PROMPT_CONTENT" '{
   sourceContext: {
-    source: "sources/github/alpeware/datachannel-clj",
+    source: "sources/github/alpeware/clj-datachannel",
     githubRepoContext: {
       startingBranch: "main"
     }

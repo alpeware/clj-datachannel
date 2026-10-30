@@ -1,10 +1,10 @@
-# datachannel-clj
+# clj-datachannel
 
 A pure Clojure implementation of WebRTC Data Channels (SCTP over DTLS over UDP). This library provides a minimal, dependency-free (except for Clojure itself) way to establish peer-to-peer data channels.
 
 ## Sans-IO Architecture
 
-`datachannel-clj` is built using a strict **"Sans-IO"** architecture. It embraces the **"Bring Your Own Loop" (BYOL)** philosophy.
+`clj-datachannel` is built using a strict **"Sans-IO"** architecture. It embraces the **"Bring Your Own Loop" (BYOL)** philosophy.
 
 The core state machine (`datachannel.core`) is completely pure and deterministic:
 - It **spawns no threads** or background processes.
@@ -23,7 +23,7 @@ This functional purity makes the library extremely resilient, entirely determini
 Add the following to your `deps.edn`:
 
 ```clojure
-{:deps {datachannel-clj/datachannel-clj {:git/url "https://github.com/your-username/datachannel-clj"
+{:deps {clj-datachannel/clj-datachannel {:git/url "https://github.com/your-username/clj-datachannel"
                                          :git/sha "..."}}}
 ```
 
@@ -124,7 +124,7 @@ Here is a concise, elegant example of how a consumer uses `datachannel.api` to e
 
 ## Use Cases
 
-Because of its lightweight, deterministic, and functionally pure nature, `datachannel-clj` is highly suitable for:
+Because of its lightweight, deterministic, and functionally pure nature, `clj-datachannel` is highly suitable for:
 
 * **Constrained Environments:** Embedding WebRTC data channels where custom threading models or zero-allocation paths are required.
 * **Deterministic Testing:** Simulating network drops, latency, and timer expirations in pure unit tests without flaky `Thread/sleep` or race conditions.

@@ -182,7 +182,7 @@ After processing all chunks in an inbound packet, the core will execute a `reass
 
 ## 9. Congestion Control (CC)
 
-To prevent network flooding, `datachannel-clj` must implement standard SCTP Congestion Control, throttling the `packetize` pipeline.
+To prevent network flooding, `clj-datachannel` must implement standard SCTP Congestion Control, throttling the `packetize` pipeline.
 
 ### 9.1 CC State Variables
 The state map tracks:
