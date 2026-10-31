@@ -193,10 +193,13 @@
                          :app-events [{:type :on-error :message "DTLS Fingerprint Mismatch"} {:type :on-close}]})
                       ;; Verification passed (or listen mode), transition to :connected normally
                       (let [state-verified (assoc state :dtls-verified? true :last-stun-received now-ms)
-                            state-verified (if (and (:client-mode? state-verified) (not (#{:established :cookie-wait :cookie-echoed} (:state state-verified))))
-                                             (:new-state (handle-event state-verified {:type :connect} now-ms))
-                                             (assoc state-verified :state :connected))
-                            base-res {:new-state state-verified :network-out (vec packets) :app-events [{:type :dtls-handshake-progress}]}]
+                            conn-res (if (and (:client-mode? state-verified) (not (#{:established :cookie-wait :cookie-echoed} (:state state-verified))))
+                                       (handle-event state-verified {:type :connect} now-ms)
+                                       {:new-state (assoc state-verified :state :connected) :network-out [] :app-events []})
+                            state-verified (:new-state conn-res)
+                            base-res {:new-state state-verified
+                                      :network-out (into (vec packets) (:network-out conn-res))
+                                      :app-events (into [{:type :dtls-handshake-progress}] (:app-events conn-res))}]
                         (if (and app-data (pos? (alength app-data)))
                           (let [sctp-buf (ByteBuffer/wrap app-data)
                                 packet (sctp/decode-packet sctp-buf)]

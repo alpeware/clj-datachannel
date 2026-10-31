@@ -141,17 +141,20 @@
                                        (if (= (:type decoded) :open)
                                          (let [ack-tsn (:next-tsn st)
                                                s2 (update st :next-tsn inc)
-                                               ack-ssn (:ssn s2)
-                                               s3 (update s2 :ssn inc)
+                                               sid (:stream-id evt)
+                                               ack-ssn (get-in s2 [:streams sid :next-tx-ssn] 0)
+                                               s3 (-> s2
+                                                      (assoc-in [:streams sid :next-tx-ssn] (inc ack-ssn))
+                                                      (update :ssn (fnil inc 0)))
                                                ack-chunk {:type :data
                                                           :flags 3 ;; B and E bits
                                                           :tsn ack-tsn
-                                                          :stream-id (:stream-id evt)
+                                                          :stream-id sid
                                                           :seq-num ack-ssn
                                                           :protocol :webrtc/dcep
                                                           :payload (dcep/encode-message {:type :ack})}
-                                               s4 (assoc-in s3 [:streams (:stream-id evt) :send-queue]
-                                                            (conj (get-in s3 [:streams (:stream-id evt) :send-queue] [])
+                                               s4 (assoc-in s3 [:streams sid :send-queue]
+                                                            (conj (get-in s3 [:streams sid :send-queue] [])
                                                                   {:tsn ack-tsn :chunk ack-chunk :sent-at 0 :retries 0 :sent? false}))
                                                channel-opts {:ordered (:ordered decoded)
                                                              :max-retransmits (:max-retransmits decoded)
@@ -160,9 +163,9 @@
                                                              :negotiated false
                                                              :label (:label decoded)
                                                              :state :open}
-                                               s5 (assoc-in s4 [:data-channels (:stream-id evt)] channel-opts)
+                                               s5 (assoc-in s4 [:data-channels sid] channel-opts)
                                                new-evt {:type :on-data-channel
-                                                        :channel (assoc channel-opts :id (:stream-id evt))}]
+                                                        :channel (assoc channel-opts :id sid)}]
                                            {:state s5 :events (conj events new-evt)})
                                          (if (= (:type decoded) :ack)
                                            (let [s2 (assoc-in st [:data-channels (:stream-id evt) :state] :open)
