@@ -303,8 +303,12 @@
                      (into {} (remove (fn [[_ child]]
                                         (let [st @(:state-atom child)
                                               last-stun (get st :last-stun-received 0)]
-                                          (and (not= (:ice-connection-state st) :connected)
-                                               (> (- now-ms last-stun) 30000))))
+                                          (or (= (:state st) :closed)
+                                              (= (:ice-connection-state st) :disconnected)
+                                              (= (:ice-connection-state st) :failed)
+                                              (and (not= (:ice-connection-state st) :connected)
+                                                   (> (- now-ms last-stun) 30000))
+                                              (> (- now-ms last-stun) 60000))))
                                       rt))))
             (reset! last-reap-time now-ms))
 
@@ -354,14 +358,15 @@
                                              (dc/handle-receive st bytes-arr now-ms sender-addr))
                                            @(:callbacks child-node)))))))))))
           (doseq [[_ child-node] @routing-table]
-            (let [current-state @(:state-atom child-node)
-                  timers (:timers current-state)]
-              (doseq [[timer-id timer] timers]
-                (when (>= now-ms (:expires-at timer))
-                  (apply-action! child-node
-                                 (fn [st]
-                                   (dc/handle-timeout st timer-id now-ms (:dtls/engine st)))
-                                 @(:callbacks child-node)))))))
+            (let [current-state @(:state-atom child-node)]
+              (when-not (= (:state current-state) :closed)
+                (let [timers (:timers current-state)]
+                  (doseq [[timer-id timer] timers]
+                    (when (>= now-ms (:expires-at timer))
+                      (apply-action! child-node
+                                     (fn [st]
+                                       (dc/handle-timeout st timer-id now-ms (:dtls/engine st)))
+                                     @(:callbacks child-node)))))))))
         (catch Exception e
           (println "Error in api listen loop:" (.getMessage e))
           (.printStackTrace e)

@@ -148,82 +148,83 @@
 
         ;; DTLS
         (and (>= first-byte 20) (<= first-byte 63))
-        (if-not engine
-          {:new-state state :network-out [] :app-events [{:type :dtls-packet :payload network-bytes}]}
-          (let [hs-status (.getHandshakeStatus engine)]
-            (if (and (or (= hs-status SSLEngineResult$HandshakeStatus/NOT_HANDSHAKING)
-                         (= hs-status SSLEngineResult$HandshakeStatus/FINISHED))
-                     (:dtls-verified? state))
-              ;; Application data
-              (try
-                (let [in-buf (ByteBuffer/wrap network-bytes)
-                      out-buf (ByteBuffer/allocateDirect 65536)
-                      {:keys [_status bytes]} (dtls/receive-app-data engine in-buf out-buf)]
-                  (if (and bytes (pos? (alength bytes)))
-                    (let [sctp-buf (ByteBuffer/wrap bytes)
-                          packet (sctp/decode-packet sctp-buf)]
-                      (if packet
-                        (handle-sctp-packet state packet now-ms)
-                        {:new-state state :network-out [] :app-events []}))
-                    {:new-state state :network-out [] :app-events []}))
-                (catch Exception _
-                  {:new-state state :network-out [] :app-events []}))
-              ;; Handshake
-              (try
-                (let [in-buf (ByteBuffer/wrap network-bytes)
-                      out-buf (ByteBuffer/allocateDirect 65536)
-                      {:keys [status packets app-data]} (dtls/handshake engine in-buf out-buf)
-                      handshake-finished? (or (= status SSLEngineResult$HandshakeStatus/FINISHED)
-                                              (= status SSLEngineResult$HandshakeStatus/NOT_HANDSHAKING))]
-                  (if (and handshake-finished?
-                           (not (:dtls-verified? state)))
-                    (if (and (:remote-fingerprint state)
-                             (not (dtls/verify-peer-fingerprint engine (:remote-fingerprint state))))
-                      (let [state-closed (assoc state :state :closed)
-                            abort-chunk {:type :abort
-                                         :flags 0
-                                         :params []}
-                            packet {:src-port (:local-port state 5000)
-                                    :dst-port (:remote-port state 5000)
-                                    :verification-tag (:remote-ver-tag state 0)
-                                    :chunks [abort-chunk]}]
-                        {:new-state state-closed
-                         :network-out (if (empty? packets) [packet] (conj (vec packets) packet))
-                         :app-events [{:type :on-error :message "DTLS Fingerprint Mismatch"} {:type :on-close}]})
-                      ;; Verification passed (or listen mode), transition to :connected normally
-                      (let [state-verified (assoc state :dtls-verified? true)
-                            state-verified (if (and (:client-mode? state-verified) (not (#{:established :cookie-wait :cookie-echoed} (:state state-verified))))
-                                             (:new-state (handle-event state-verified {:type :connect} now-ms))
-                                             (assoc state-verified :state :connected))
-                            base-res {:new-state state-verified :network-out (vec packets) :app-events [{:type :dtls-handshake-progress}]}]
-                        (if (and app-data (pos? (alength app-data)))
-                          (let [sctp-buf (ByteBuffer/wrap app-data)
-                                packet (sctp/decode-packet sctp-buf)]
-                            (if packet
-                              (let [sctp-res (handle-sctp-packet (:new-state base-res) packet now-ms)]
-                                (-> sctp-res
-                                    (update :network-out (fn [no] (into (:network-out base-res) no)))
-                                    (update :app-events (fn [evts] (into (:app-events base-res) evts)))))
-                              base-res))
-                          (if (seq (:pending-control-chunks (:new-state base-res)))
-                            (packetize (:new-state base-res) (:app-events base-res) now-ms)
-                            base-res))))
-                    (if (and app-data (pos? (alength app-data)))
-                      (let [sctp-buf (ByteBuffer/wrap app-data)
+        (let [state (assoc state :last-stun-received now-ms)]
+          (if-not engine
+            {:new-state state :network-out [] :app-events [{:type :dtls-packet :payload network-bytes}]}
+            (let [hs-status (.getHandshakeStatus engine)]
+              (if (and (or (= hs-status SSLEngineResult$HandshakeStatus/NOT_HANDSHAKING)
+                           (= hs-status SSLEngineResult$HandshakeStatus/FINISHED))
+                       (:dtls-verified? state))
+                ;; Application data
+                (try
+                  (let [in-buf (ByteBuffer/wrap network-bytes)
+                        out-buf (ByteBuffer/allocateDirect 65536)
+                        {:keys [_status bytes]} (dtls/receive-app-data engine in-buf out-buf)]
+                    (if (and bytes (pos? (alength bytes)))
+                      (let [sctp-buf (ByteBuffer/wrap bytes)
                             packet (sctp/decode-packet sctp-buf)]
                         (if packet
-                          (let [sctp-res (handle-sctp-packet state packet now-ms)]
-                            (-> sctp-res
-                                (update :network-out (fn [no] (into (vec packets) no)))
-                                (update :app-events conj {:type :dtls-handshake-progress})))
-                          {:new-state state :network-out (vec packets) :app-events [{:type :dtls-handshake-progress}]}))
-                      {:new-state state :network-out (vec packets) :app-events [{:type :dtls-handshake-progress}]})))
-                (catch Exception e
-                  (println "DTLS HANDSHAKE EXCEPTION" (.getMessage e))
-                  (let [err-msg (if (.getMessage e) (.getMessage e) "DTLS Fingerprint Mismatch")]
-                    {:new-state (assoc state :state :closed)
-                     :network-out []
-                     :app-events [{:type :on-error :message err-msg} {:type :on-close}]}))))))
+                          (handle-sctp-packet state packet now-ms)
+                          {:new-state state :network-out [] :app-events []}))
+                      {:new-state state :network-out [] :app-events []}))
+                  (catch Exception _
+                    {:new-state state :network-out [] :app-events []}))
+                ;; Handshake
+                (try
+                  (let [in-buf (ByteBuffer/wrap network-bytes)
+                        out-buf (ByteBuffer/allocateDirect 65536)
+                        {:keys [status packets app-data]} (dtls/handshake engine in-buf out-buf)
+                        handshake-finished? (or (= status SSLEngineResult$HandshakeStatus/FINISHED)
+                                                (= status SSLEngineResult$HandshakeStatus/NOT_HANDSHAKING))]
+                    (if (and handshake-finished?
+                             (not (:dtls-verified? state)))
+                      (if (and (:remote-fingerprint state)
+                               (not (dtls/verify-peer-fingerprint engine (:remote-fingerprint state))))
+                        (let [state-closed (assoc state :state :closed)
+                              abort-chunk {:type :abort
+                                           :flags 0
+                                           :params []}
+                              packet {:src-port (:local-port state 5000)
+                                      :dst-port (:remote-port state 5000)
+                                      :verification-tag (:remote-ver-tag state 0)
+                                      :chunks [abort-chunk]}]
+                          {:new-state state-closed
+                           :network-out (if (empty? packets) [packet] (conj (vec packets) packet))
+                           :app-events [{:type :on-error :message "DTLS Fingerprint Mismatch"} {:type :on-close}]})
+                        ;; Verification passed (or listen mode), transition to :connected normally
+                        (let [state-verified (assoc state :dtls-verified? true)
+                              state-verified (if (and (:client-mode? state-verified) (not (#{:established :cookie-wait :cookie-echoed} (:state state-verified))))
+                                               (:new-state (handle-event state-verified {:type :connect} now-ms))
+                                               (assoc state-verified :state :connected))
+                              base-res {:new-state state-verified :network-out (vec packets) :app-events [{:type :dtls-handshake-progress}]}]
+                          (if (and app-data (pos? (alength app-data)))
+                            (let [sctp-buf (ByteBuffer/wrap app-data)
+                                  packet (sctp/decode-packet sctp-buf)]
+                              (if packet
+                                (let [sctp-res (handle-sctp-packet (:new-state base-res) packet now-ms)]
+                                  (-> sctp-res
+                                      (update :network-out (fn [no] (into (:network-out base-res) no)))
+                                      (update :app-events (fn [evts] (into (:app-events base-res) evts)))))
+                                base-res))
+                            (if (seq (:pending-control-chunks (:new-state base-res)))
+                              (packetize (:new-state base-res) (:app-events base-res) now-ms)
+                              base-res))))
+                      (if (and app-data (pos? (alength app-data)))
+                        (let [sctp-buf (ByteBuffer/wrap app-data)
+                              packet (sctp/decode-packet sctp-buf)]
+                          (if packet
+                            (let [sctp-res (handle-sctp-packet state packet now-ms)]
+                              (-> sctp-res
+                                  (update :network-out (fn [no] (into (vec packets) no)))
+                                  (update :app-events conj {:type :dtls-handshake-progress})))
+                            {:new-state state :network-out (vec packets) :app-events [{:type :dtls-handshake-progress}]}))
+                        {:new-state state :network-out (vec packets) :app-events [{:type :dtls-handshake-progress}]})))
+                  (catch Exception e
+                    (println "DTLS HANDSHAKE EXCEPTION" (.getMessage e))
+                    (let [err-msg (if (.getMessage e) (.getMessage e) "DTLS Fingerprint Mismatch")]
+                      {:new-state (assoc state :state :closed)
+                       :network-out []
+                       :app-events [{:type :on-error :message err-msg} {:type :on-close}]})))))))
 
         ;; SCTP (Default, raw)
         :else
@@ -240,6 +241,7 @@
     {:cookie-secret cookie-secret
      :remote-ver-tag 0
      :local-ver-tag local-ver-tag
+     :last-stun-received (System/currentTimeMillis)
      :next-tsn 0
      :ssn 0
      :timers (merge (if (seq (get options :remote-candidates [])) {:stun/check-candidates {:expires-at 0}} {})
