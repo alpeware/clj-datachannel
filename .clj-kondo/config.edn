@@ -3,11 +3,19 @@
                                        datachannel.sctp-gen-test/test-sctp-state-machine-invariants
                                        datachannel.tcp-test/test-rfc4571-framing-roundtrip-arbitrary-chunks
                                        datachannel.tcp-test/test-rfc4571-incomplete-frame-preserved-in-remaining
+                                       datachannel.tcp-test/prop-parse-proxy-url-invariants
+                                       datachannel.tcp-test/prop-build-and-parse-connect-roundtrip
+                                       datachannel.tcp-test/prop-parse-connect-response-errors
+                                       datachannel.tcp-test/prop-parse-connect-response-incomplete
                                        fuzz-handle-receive-no-crashes
                                        test-sctp-state-machine-invariants
                                        test-chaos-connection-establishment
                                        test-rfc4571-framing-roundtrip-arbitrary-chunks
-                                       test-rfc4571-incomplete-frame-preserved-in-remaining]}
+                                       test-rfc4571-incomplete-frame-preserved-in-remaining
+                                       prop-parse-proxy-url-invariants
+                                       prop-build-and-parse-connect-roundtrip
+                                       prop-parse-connect-response-errors
+                                       prop-parse-connect-response-incomplete]}
            :large-def {:level :warning :row-threshold 60}
            :too-many-params {:level :warning :max-params 5}
            :missing-docstring {:level :warning}

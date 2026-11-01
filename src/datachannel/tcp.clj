@@ -1,8 +1,12 @@
 (ns datachannel.tcp
   "RFC 4571 framing and TCP NIO socket helpers for WebRTC DataChannel transport."
-  (:import [java.net InetSocketAddress StandardSocketOptions]
+  (:require [clojure.string :as str])
+  (:import [java.io ByteArrayOutputStream]
+           [java.net InetSocketAddress StandardSocketOptions]
            [java.nio ByteBuffer]
-           [java.nio.channels ServerSocketChannel SocketChannel]))
+           [java.nio.channels ServerSocketChannel SocketChannel]
+           [java.nio.charset StandardCharsets]
+           [java.util Base64]))
 
 ;; -----------------------------------------------------------------------------
 ;; 1. Pure RFC 4571 §3 Framing & Deframing
@@ -101,3 +105,153 @@
           buf (ByteBuffer/wrap framed)]
       (while (.hasRemaining buf)
         (.write ch buf)))))
+
+;; -----------------------------------------------------------------------------
+;; 3. HTTP CONNECT Proxy Client (Preemptive Auth & Tunneling)
+;; -----------------------------------------------------------------------------
+
+(defn parse-proxy-url
+  "Pure function. Parses a proxy URL string or map into {:host ... :port ... :proxy-auth ...}.
+   Supports http://user:pass@host:port, http://host:port, host:port, or host (defaults to port 8080)."
+  [proxy-spec]
+  (if (map? proxy-spec)
+    {:host (:host proxy-spec)
+     :port (int (or (:port proxy-spec) 8080))
+     :proxy-auth (:proxy-auth proxy-spec)}
+    (let [raw (str/trim (or proxy-spec ""))
+          cleaned (str/replace-first raw #"^https?://" "")
+          at-idx (str/index-of cleaned "@")
+          auth (when (and at-idx (pos? at-idx))
+                 (subs cleaned 0 at-idx))
+          host-port (if at-idx (subs cleaned (inc at-idx)) cleaned)]
+      (cond
+        ;; Bracketed IPv6: [::1]:8080 or [::1]
+        (str/starts-with? host-port "[")
+        (let [close-bracket (str/index-of host-port "]")
+              host (subs host-port 1 close-bracket)
+              port-str (when (> (count host-port) (inc close-bracket))
+                         (subs host-port (+ close-bracket 2)))]
+          {:host host
+           :port (if (seq port-str) (Integer/parseInt port-str) 8080)
+           :proxy-auth (when (seq auth) auth)})
+
+        ;; Host with port: host:port
+        (str/includes? host-port ":")
+        (let [last-colon (str/last-index-of host-port ":")
+              host (subs host-port 0 last-colon)
+              port-str (subs host-port (inc last-colon))]
+          {:host host
+           :port (Integer/parseInt port-str)
+           :proxy-auth (when (seq auth) auth)})
+
+        ;; Host only: default port 8080
+        :else
+        {:host host-port
+         :port 8080
+         :proxy-auth (when (seq auth) auth)}))))
+
+(defn build-connect-request
+  "Pure function. Formats an HTTP CONNECT request as UTF-8 bytes.
+   Preemptively includes Proxy-Authorization: Basic <base64> if :proxy-auth is provided."
+  [{:keys [target-host target-port proxy-auth]}]
+  (let [target (str target-host ":" target-port)
+        auth-hdr (when (and proxy-auth (seq proxy-auth))
+                   (let [b64 (.encodeToString (Base64/getEncoder)
+                                              (.getBytes ^String proxy-auth StandardCharsets/UTF_8))]
+                     (str "Proxy-Authorization: Basic " b64 "\r\n")))
+        req-str (str "CONNECT " target " HTTP/1.1\r\n"
+                     "Host: " target "\r\n"
+                     "Proxy-Connection: keep-alive\r\n"
+                     (or auth-hdr "")
+                     "\r\n")]
+    (.getBytes req-str StandardCharsets/UTF_8)))
+
+(defn parse-connect-response
+  "Pure function. Parses an HTTP CONNECT response from byte buffer.
+   Returns:
+     - {:status :ok :http-status 200 :remaining <byte-array>}
+     - {:status :error :http-status <code> :message <msg> :remaining <byte-array>}
+     - {:status :incomplete}"
+  [^bytes buf]
+  (if (or (nil? buf) (zero? (alength buf)))
+    {:status :incomplete}
+    (let [len (alength buf)
+          header-end
+          (loop [idx 0]
+            (if (<= (+ idx 4) len)
+              (if (and (= (aget buf idx) (byte 13))
+                       (= (aget buf (+ idx 1)) (byte 10))
+                       (= (aget buf (+ idx 2)) (byte 13))
+                       (= (aget buf (+ idx 3)) (byte 10)))
+                (+ idx 4)
+                (if (and (= (aget buf idx) (byte 10))
+                         (= (aget buf (+ idx 1)) (byte 10)))
+                  (+ idx 2)
+                  (recur (inc idx))))
+              (when (and (<= (+ idx 2) len)
+                         (= (aget buf idx) (byte 10))
+                         (= (aget buf (inc idx)) (byte 10)))
+                (+ idx 2))))]
+      (if-not header-end
+        {:status :incomplete}
+        (let [hdr-str (String. buf 0 (int header-end) StandardCharsets/UTF_8)
+              status-line (first (str/split-lines hdr-str))
+              [_ status-code-str reason] (re-matches #"HTTP/\d\.\d\s+(\d{3})(?:\s+(.*))?" (or status-line ""))
+              rem-len (- len header-end)
+              rem-bytes (byte-array rem-len)]
+          (when (pos? rem-len)
+            (System/arraycopy buf header-end rem-bytes 0 rem-len))
+          (if-let [code (when status-code-str (Integer/parseInt status-code-str))]
+            (if (= code 200)
+              {:status :ok :http-status 200 :remaining rem-bytes}
+              {:status :error :http-status code :message (or reason hdr-str) :remaining rem-bytes})
+            {:status :error :http-status 0 :message (str "Malformed HTTP status line: " status-line) :remaining rem-bytes}))))))
+
+(defn connect-via-proxy-socket-channel
+  "Connects to target-host:target-port through an HTTP CONNECT proxy.
+   Performs the HTTP CONNECT handshake with preemptive Basic proxy auth,
+   and configures the channel for non-blocking I/O.
+   Returns {:channel SocketChannel :remaining byte[]}. Throws on failure."
+  ([proxy-spec target-host target-port]
+   (connect-via-proxy-socket-channel proxy-spec target-host target-port 5000))
+  ([proxy-spec target-host target-port timeout-ms]
+   (let [proxy-map (parse-proxy-url proxy-spec)
+         socket-ch (SocketChannel/open)]
+     (.setOption socket-ch StandardSocketOptions/TCP_NODELAY true)
+     (let [sock (.socket socket-ch)
+           proxy-addr (InetSocketAddress. ^String (:host proxy-map) (int (:port proxy-map)))]
+       (.connect sock proxy-addr (int (or timeout-ms 5000))))
+     (try
+       (let [req-bytes (build-connect-request {:target-host target-host
+                                               :target-port target-port
+                                               :proxy-auth (:proxy-auth proxy-map)})
+             req-buf (ByteBuffer/wrap req-bytes)]
+         (while (.hasRemaining req-buf)
+           (.write socket-ch req-buf))
+         (let [read-buf (ByteBuffer/allocate 4096)
+               baos (ByteArrayOutputStream.)]
+           (loop []
+             (let [n (.read socket-ch read-buf)]
+               (if (neg? n)
+                 (throw (ex-info "Proxy closed connection during CONNECT handshake" {:status :error :http-status 0}))
+                 (do
+                   (.flip read-buf)
+                   (let [bytes-read (byte-array (.remaining read-buf))]
+                     (.get read-buf bytes-read)
+                     (.write baos bytes-read 0 (alength bytes-read)))
+                   (.clear read-buf)
+                   (let [curr-bytes (.toByteArray baos)
+                         parsed (parse-connect-response curr-bytes)]
+                     (case (:status parsed)
+                       :ok
+                       (do
+                         (.configureBlocking socket-ch false)
+                         {:channel socket-ch :remaining (:remaining parsed)})
+                       :error
+                       (throw (ex-info (str "HTTP CONNECT proxy handshake failed: " (:http-status parsed) " " (:message parsed))
+                                       parsed))
+                       :incomplete
+                       (recur)))))))))
+       (catch Exception e
+         (try (.close socket-ch) (catch Exception _ nil))
+         (throw e))))))

@@ -507,7 +507,7 @@
 
 (defn start-tcp!
   "Connects to a remote peer via TCP (RFC 4571 framing), starts loop, and triggers callbacks.
-  `remote-sdp-params` must contain `:ip`, `:port`."
+  `remote-sdp-params` must contain `:ip`, `:port`. Supports optional `:proxy` in `remote-sdp-params`."
   [node remote-sdp-params callbacks]
   (let [local-setup (get-in node [:local-sdp-params :setup] "active")
         client-mode? (= local-setup "active")
@@ -526,9 +526,17 @@
                                                  [{:ip remote-ip :port remote-port}]
                                                  [])})
                     client-mode?)
-        socket-ch (tcp/connect-socket-channel remote-ip remote-port 5000)
+        proxy-opts (:proxy remote-sdp-params)
+        proxy-res (when (and client-mode? proxy-opts)
+                    (tcp/connect-via-proxy-socket-channel proxy-opts remote-ip remote-port 5000))
+        socket-ch (if proxy-res
+                    (:channel proxy-res)
+                    (tcp/connect-socket-channel remote-ip remote-port 5000))
+        initial-rem (when proxy-res (:remaining proxy-res))
         ^Selector selector (nio/create-selector)
-        deframer-atom (atom (byte-array 0))]
+        deframer-atom (atom (if (and initial-rem (pos? (alength ^bytes initial-rem)))
+                              initial-rem
+                              (byte-array 0)))]
     (.register socket-ch selector SelectionKey/OP_READ)
     (reset! (:channel node) socket-ch)
     (reset! (:selector node) selector)
