@@ -3,10 +3,11 @@
             [datachannel.core :as dc]
             [datachannel.dtls :as dtls]
             [datachannel.nio :as nio]
-            [datachannel.sdp :as sdp])
-  (:import [java.nio ByteBuffer]
-           [java.nio.channels DatagramChannel Selector SelectionKey]
-           [java.net InetSocketAddress]))
+            [datachannel.sdp :as sdp]
+            [datachannel.tcp :as tcp])
+  (:import [java.net InetSocketAddress StandardSocketOptions]
+           [java.nio ByteBuffer]
+           [java.nio.channels DatagramChannel SelectionKey Selector ServerSocketChannel SocketChannel]))
 
 (defn set-callbacks!
   "Sets the callbacks for a given node dynamically."
@@ -61,20 +62,38 @@
       (when (and pure-remote-addr (not= pure-remote-addr @(:remote-addr node)))
         (reset! (:remote-addr node) pure-remote-addr)))
     (when channel
-      (doseq [buf network-out-bytes]
-        (if (and (map? buf) (:packet buf))
-          (let [{:keys [packet target]} buf
-                dest-addr (if (string? target)
-                            (let [[ip port] (str/split target #":")]
-                              (InetSocketAddress. ^String ip (Integer/parseInt port)))
-                            (if (and (map? target) (:ip target) (:port target))
-                              (InetSocketAddress. ^String (:ip target) (Integer/parseInt (str (:port target))))
-                              target))
-                wrapped-packet (if (instance? ByteBuffer packet) packet (ByteBuffer/wrap packet))]
-            (.send channel ^ByteBuffer wrapped-packet dest-addr))
-          (let [dest-addr @(:remote-addr node)]
-            (when dest-addr
-              (.send channel ^ByteBuffer buf dest-addr))))))
+      (if (or (:tcp? node) (instance? java.nio.channels.SocketChannel channel))
+        (doseq [buf network-out-bytes]
+          (let [pkt-bytes (cond
+                            (and (map? buf) (:packet buf))
+                            (let [p (:packet buf)]
+                              (if (instance? ByteBuffer p)
+                                (let [dup (.duplicate ^ByteBuffer p)
+                                      arr (byte-array (.remaining dup))]
+                                  (.get dup arr)
+                                  arr)
+                                p))
+                            (instance? ByteBuffer buf)
+                            (let [dup (.duplicate ^ByteBuffer buf)
+                                  arr (byte-array (.remaining dup))]
+                              (.get dup arr)
+                              arr)
+                            :else buf)]
+            (tcp/write-framed-packet! channel pkt-bytes)))
+        (doseq [buf network-out-bytes]
+          (if (and (map? buf) (:packet buf))
+            (let [{:keys [packet target]} buf
+                  dest-addr (if (string? target)
+                              (let [[ip port] (str/split target #":")]
+                                (InetSocketAddress. ^String ip (Integer/parseInt port)))
+                              (if (and (map? target) (:ip target) (:port target))
+                                (InetSocketAddress. ^String (:ip target) (Integer/parseInt (str (:port target))))
+                                target))
+                  wrapped-packet (if (instance? ByteBuffer packet) packet (ByteBuffer/wrap packet))]
+              (.send ^DatagramChannel channel ^ByteBuffer wrapped-packet dest-addr))
+            (let [dest-addr @(:remote-addr node)]
+              (when dest-addr
+                (.send ^DatagramChannel channel ^ByteBuffer buf dest-addr)))))))
     (doseq [evt app-events]
       (case (:type evt)
         :on-message (when-let [cb (:on-message callbacks)]
@@ -275,13 +294,22 @@
                      {}))
     (when-let [fut @(:loop-future node)]
       (future-cancel fut))
+    (when-let [rt-atom (:routing-table node)]
+      (doseq [[_ child] @rt-atom]
+        (try (close! child) (catch Exception _ nil)))
+      (reset! rt-atom {}))
     (when-not (:shared-channel? node)
-      (when-let [^DatagramChannel channel @(:channel node)]
-        (when (.isOpen channel)
-          (.close channel)))
+      (when-let [^java.io.Closeable channel @(:channel node)]
+        (try
+          (when (or (not (instance? java.nio.channels.Channel channel))
+                    (.isOpen ^java.nio.channels.Channel channel))
+            (.close channel))
+          (catch Exception _ nil)))
       (when-let [^Selector selector @(:selector node)]
-        (when (.isOpen selector)
-          (.close selector))))
+        (try
+          (when (.isOpen selector)
+            (.close selector))
+          (catch Exception _ nil))))
     (reset! (:channel node) nil)
     (reset! (:selector node) nil)
     (reset! (:loop-future node) nil)))
@@ -399,5 +427,283 @@
     (nio/register-for-read channel selector)
     (let [fut (future
                 (listen-loop-body opts cert-data ice-creds channel selector routing-table listener-callbacks))]
+      (reset! (:loop-future listener-node) fut)
+      listener-node)))
+
+;; -----------------------------------------------------------------------------
+;; TCP Active Client (RFC 4571 Framing)
+;; -----------------------------------------------------------------------------
+
+(defn- start-tcp-io-loop!
+  "Runs the NIO selector read loop for a TCP client socket channel."
+  [node callbacks]
+  (let [^Selector selector @(:selector node)
+        ^SocketChannel socket-ch @(:channel node)
+        remote-addr @(:remote-addr node)
+        deframer-atom (:deframer-atom node)]
+    (future
+      (let [recv-buf (ByteBuffer/allocateDirect 65536)]
+        (while @(:running node)
+          (try
+            (let [ready (.select selector 10)
+                  now-ms (System/currentTimeMillis)]
+              (when (pos? ready)
+                (let [selected-keys (.selectedKeys selector)
+                      iter (.iterator selected-keys)]
+                  (while (.hasNext iter)
+                    (let [^SelectionKey key (.next iter)]
+                      (.remove iter)
+                      (when (.isReadable key)
+                        (.clear recv-buf)
+                        (let [n (try (.read socket-ch recv-buf) (catch Exception _ -1))]
+                          (cond
+                            (neg? n)
+                            (do
+                              (reset! (:running node) false)
+                              (when-let [cb (:on-close callbacks)]
+                                (cb {:type :on-close})))
+
+                            (pos? n)
+                            (do
+                              (.flip recv-buf)
+                              (let [len (.remaining recv-buf)
+                                    bytes-arr (byte-array len)]
+                                (.get recv-buf bytes-arr)
+                                (let [{:keys [frames remaining]} (tcp/decode-rfc4571-stream @deframer-atom bytes-arr)]
+                                  (reset! deframer-atom remaining)
+                                  (doseq [frame frames]
+                                    (apply-action! node
+                                                   (fn [st]
+                                                     (dc/handle-receive st frame now-ms remote-addr))
+                                                   callbacks))))))))))))
+              (let [current-state @(:state-atom node)
+                    timers (:timers current-state)]
+                (doseq [[timer-id timer] timers]
+                  (when (>= now-ms (:expires-at timer))
+                    (apply-action! node
+                                   (fn [st]
+                                     (dc/handle-timeout st timer-id now-ms (:dtls/engine st)))
+                                   callbacks)))))
+            (catch Exception e
+              (when @(:running node)
+                (when-let [cb (:on-error callbacks)]
+                  (cb {:type :on-error :cause e}))))))))))
+
+(defn- start-tcp-client-kickoff!
+  "Kicks off active client STUN and DTLS handshake sequence."
+  [node callbacks]
+  (future
+    (Thread/sleep 100)
+    (apply-action! node
+                   (fn [st]
+                     (dc/handle-timeout st :stun/keepalive (System/currentTimeMillis) nil))
+                   callbacks)
+    (apply-action! node
+                   (fn [st]
+                     (when-let [engine (:dtls/engine st)]
+                       (.beginHandshake ^javax.net.ssl.SSLEngine engine))
+                     (dc/handle-timeout st :dtls/flight-timeout (System/currentTimeMillis) (:dtls/engine st)))
+                   callbacks)))
+
+(defn start-tcp!
+  "Connects to a remote peer via TCP (RFC 4571 framing), starts loop, and triggers callbacks.
+  `remote-sdp-params` must contain `:ip`, `:port`."
+  [node remote-sdp-params callbacks]
+  (let [local-setup (get-in node [:local-sdp-params :setup] "active")
+        client-mode? (= local-setup "active")
+        remote-ip (:ip remote-sdp-params)
+        remote-port (int (:port remote-sdp-params))
+        remote-addr (InetSocketAddress. ^String remote-ip remote-port)
+        conn-state (dc/create-connection
+                    (merge (:opts node)
+                           {:cert-data (:cert-data node)
+                            :ice-ufrag (:ufrag (:ice-creds node))
+                            :ice-pwd (:pwd (:ice-creds node))
+                            :remote-ice-ufrag (:remote-ice-ufrag remote-sdp-params)
+                            :remote-ice-pwd (:remote-ice-pwd remote-sdp-params)
+                            :remote-fingerprint (:fingerprint remote-sdp-params)
+                            :remote-candidates (if (and remote-ip remote-port)
+                                                 [{:ip remote-ip :port remote-port}]
+                                                 [])})
+                    client-mode?)
+        socket-ch (tcp/connect-socket-channel remote-ip remote-port 5000)
+        ^Selector selector (nio/create-selector)
+        deframer-atom (atom (byte-array 0))]
+    (.register socket-ch selector SelectionKey/OP_READ)
+    (reset! (:channel node) socket-ch)
+    (reset! (:selector node) selector)
+    (reset! (:state-atom node) conn-state)
+    (reset! (:running node) true)
+    (reset! (:remote-addr node) remote-addr)
+    (let [tcp-node (assoc node :tcp? true :deframer-atom deframer-atom)
+          fut (start-tcp-io-loop! tcp-node callbacks)]
+      (reset! (:loop-future node) fut)
+      (when client-mode?
+        (start-tcp-client-kickoff! tcp-node callbacks))
+      tcp-node)))
+
+;; -----------------------------------------------------------------------------
+;; TCP Multiplexed Listener (RFC 4571 Framing)
+;; -----------------------------------------------------------------------------
+
+(defn- handle-tcp-accept!
+  "Accepts incoming client SocketChannel, initializes child node and registers for read."
+  [listener-node listener-callbacks]
+  (let [server-ch ^ServerSocketChannel @(:channel listener-node)
+        selector ^Selector @(:selector listener-node)
+        client-ch (.accept server-ch)]
+    (when client-ch
+      (.setOption client-ch StandardSocketOptions/TCP_NODELAY true)
+      (.configureBlocking client-ch false)
+      (.register client-ch selector SelectionKey/OP_READ)
+      (let [opts (:opts listener-node)
+            cert-data (:cert-data listener-node)
+            ice-creds (:ice-creds listener-node)
+            port (get opts :port 5000)
+            remote-addr (.getRemoteAddress client-ch)
+            child-node {:opts opts
+                        :tcp? true
+                        :cert-data cert-data
+                        :ice-creds ice-creds
+                        :local-sdp-params {:port port
+                                           :ice-ufrag (:ufrag ice-creds)
+                                           :ice-pwd (:pwd ice-creds)
+                                           :fingerprint (:fingerprint cert-data)
+                                           :setup "passive"}
+                        :running (atom true)
+                        :state-atom (atom (dc/create-connection
+                                           (merge opts
+                                                  {:cert-data cert-data
+                                                   :ice-ufrag (:ufrag ice-creds)
+                                                   :ice-pwd (:pwd ice-creds)})
+                                           false))
+                        :channel (atom client-ch)
+                        :selector (atom selector)
+                        :loop-future (atom nil)
+                        :remote-addr (atom remote-addr)
+                        :deframer-atom (atom (byte-array 0))
+                        :shared-channel? false
+                        :callbacks (atom {})}]
+        (swap! (:routing-table listener-node) assoc client-ch child-node)
+        (when-let [cb (:on-connection listener-callbacks)]
+          (cb child-node))))))
+
+(defn- handle-tcp-read!
+  "Reads from client SocketChannel, deframes RFC 4571 packets, and feeds to child node."
+  [^SelectionKey key routing-table ^ByteBuffer recv-buf now-ms]
+  (let [client-ch ^SocketChannel (.channel key)]
+    (if-let [child-node (get @routing-table client-ch)]
+      (do
+        (.clear recv-buf)
+        (let [n (try (.read client-ch recv-buf) (catch Exception _ -1))]
+          (cond
+            (neg? n)
+            (do
+              (swap! routing-table dissoc client-ch)
+              (try (.close client-ch) (catch Exception _ nil))
+              (reset! (:running child-node) false)
+              (when-let [cb (:on-close @(:callbacks child-node))]
+                (cb {:type :on-close})))
+
+            (pos? n)
+            (do
+              (.flip recv-buf)
+              (let [len (.remaining recv-buf)
+                    bytes-arr (byte-array len)]
+                (.get recv-buf bytes-arr)
+                (let [{:keys [frames remaining]} (tcp/decode-rfc4571-stream @(:deframer-atom child-node) bytes-arr)]
+                  (reset! (:deframer-atom child-node) remaining)
+                  (doseq [frame frames]
+                    (apply-action! child-node
+                                   (fn [st]
+                                     (dc/handle-receive st frame now-ms @(:remote-addr child-node)))
+                                   @(:callbacks child-node)))))))))
+      (try (.cancel key) (.close client-ch) (catch Exception _ nil)))))
+
+(defn- reap-tcp-connections!
+  "Reaps inactive or closed client connections from routing table."
+  [routing-table now-ms]
+  (swap! routing-table
+         (fn [rt]
+           (into {} (remove (fn [[ch child]]
+                              (let [st @(:state-atom child)
+                                    last-activity (or (get st :last-stun-received) 0)
+                                    dead? (or (not (.isOpen ^SocketChannel ch))
+                                              (= (:state st) :closed)
+                                              (= (:ice-connection-state st) :disconnected)
+                                              (= (:ice-connection-state st) :failed)
+                                              (> (- now-ms last-activity) 60000))]
+                                (when dead?
+                                  (try (.close ^SocketChannel ch) (catch Exception _ nil)))
+                                dead?))
+                            rt)))))
+
+(defn- tcp-listen-loop-body
+  "Processes TCP multiplexed listen loop, accepting clients, deframing packets, and firing timers."
+  [listener-node listener-callbacks]
+  (let [selector ^Selector @(:selector listener-node)
+        routing-table (:routing-table listener-node)
+        recv-buf (ByteBuffer/allocateDirect 65536)
+        last-reap (atom (System/currentTimeMillis))]
+    (while @(:running listener-callbacks)
+      (try
+        (let [ready (.select selector 10)
+              now-ms (System/currentTimeMillis)]
+          (when (> (- now-ms @last-reap) 10000)
+            (reap-tcp-connections! routing-table now-ms)
+            (reset! last-reap now-ms))
+          (when (pos? ready)
+            (let [selected-keys (.selectedKeys selector)
+                  iter (.iterator selected-keys)]
+              (while (.hasNext iter)
+                (let [^SelectionKey key (.next iter)]
+                  (.remove iter)
+                  (cond
+                    (.isAcceptable key)
+                    (handle-tcp-accept! listener-node listener-callbacks)
+
+                    (.isReadable key)
+                    (handle-tcp-read! key routing-table recv-buf now-ms))))))
+          (doseq [[_ child-node] @routing-table]
+            (let [current-state @(:state-atom child-node)]
+              (when-not (= (:state current-state) :closed)
+                (let [timers (:timers current-state)]
+                  (doseq [[timer-id timer] timers]
+                    (when (>= now-ms (:expires-at timer))
+                      (apply-action! child-node
+                                     (fn [st]
+                                       (dc/handle-timeout st timer-id now-ms (:dtls/engine st)))
+                                     @(:callbacks child-node)))))))))
+        (catch Exception e
+          (when @(:running listener-callbacks)
+            (when-let [cb (:on-error listener-callbacks)]
+              (cb {:type :on-error :cause e}))))))))
+
+(defn listen-tcp!
+  "Starts a TCP listener on the given port (RFC 4571 framing) that multiplexes incoming connections.
+  `opts` should contain `:port`.
+  `listener-callbacks` should contain `:on-connection` which receives each new child node."
+  [opts listener-callbacks]
+  (let [port (get opts :port 5000)
+        ice-creds (or (:ice-creds opts) (sdp/generate-ice-credentials))
+        cert-data (or (:cert-data opts) (dtls/generate-cert))
+        server-ch (tcp/create-server-socket-channel port)
+        ^Selector selector (nio/create-selector)
+        routing-table (atom {})
+        running (atom true)
+        listener-node {:opts opts
+                       :tcp? true
+                       :running running
+                       :channel (atom server-ch)
+                       :selector (atom selector)
+                       :routing-table routing-table
+                       :loop-future (atom nil)
+                       :shared-channel? false
+                       :ice-creds ice-creds
+                       :cert-data cert-data}
+        listener-callbacks (assoc listener-callbacks :running running)]
+    (.register server-ch selector SelectionKey/OP_ACCEPT)
+    (let [fut (future
+                (tcp-listen-loop-body listener-node listener-callbacks))]
       (reset! (:loop-future listener-node) fut)
       listener-node)))
