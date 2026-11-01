@@ -429,7 +429,7 @@
                 (catch Exception _ nil)))
           t0 (System/currentTimeMillis)]
       (try
-        (is (thrown? Exception
+        (is (thrown? java.net.SocketTimeoutException
                      (tcp/connect-via-proxy-socket-channel
                       (str "http://127.0.0.1:" proxy-port)
                       "target.example.com"
