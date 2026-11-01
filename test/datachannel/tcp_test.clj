@@ -413,3 +413,30 @@
                               (api/start-tcp! client-node remote-sdp {})))
         (finally
           ((:stop-fn proxy)))))))
+
+(deftest test-http-connect-proxy-read-timeout
+  (testing "connect-via-proxy-socket-channel fails with timeout when proxy stalls before sending response"
+    (let [proxy-port (find-free-port)
+          server-sock (ServerSocket. (int proxy-port))
+          running? (atom true)
+          _ (future
+              (try
+                (while @running?
+                  (let [client (.accept server-sock)
+                        in (.getInputStream client)
+                        buf (byte-array 1024)]
+                    (.read in buf 0 1024)))
+                (catch Exception _ nil)))
+          t0 (System/currentTimeMillis)]
+      (try
+        (is (thrown? Exception
+                     (tcp/connect-via-proxy-socket-channel
+                      (str "http://127.0.0.1:" proxy-port)
+                      "target.example.com"
+                      443
+                      200)))
+        (let [elapsed (- (System/currentTimeMillis) t0)]
+          (is (< elapsed 800) (str "Handshake should time out quickly, took: " elapsed "ms")))
+        (finally
+          (reset! running? false)
+          (try (.close server-sock) (catch Exception _ nil)))))))

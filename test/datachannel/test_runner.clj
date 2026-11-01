@@ -60,6 +60,7 @@
             [datachannel.stun-integration-test]
             [datachannel.stun-test]
             [datachannel.stun-webrtc-integration-test]
+            [datachannel.tcp-test]
             [datachannel.webrtc-integration-test]
             [datachannel.webrtc-java-test]))
 
@@ -73,7 +74,8 @@
     'datachannel.stun-integration-test
     'datachannel.sans-io-integration-test
     'datachannel.pure-p2p-integration-test
-    'datachannel.pure-p2p-mitm-integration-test]
+    'datachannel.pure-p2p-mitm-integration-test
+    'datachannel.tcp-test]
 
    ;; Group 2: Pure/Stateless tests part 1
    ['datachannel.enforce-dtls-test

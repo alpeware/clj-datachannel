@@ -2,7 +2,7 @@
   "RFC 4571 framing and TCP NIO socket helpers for WebRTC DataChannel transport."
   (:require [clojure.string :as str])
   (:import [java.io ByteArrayOutputStream]
-           [java.net InetSocketAddress StandardSocketOptions]
+           [java.net InetSocketAddress SocketTimeoutException StandardSocketOptions]
            [java.nio ByteBuffer]
            [java.nio.channels ServerSocketChannel SocketChannel]
            [java.nio.charset StandardCharsets]
@@ -215,43 +215,48 @@
   ([proxy-spec target-host target-port]
    (connect-via-proxy-socket-channel proxy-spec target-host target-port 5000))
   ([proxy-spec target-host target-port timeout-ms]
-   (let [proxy-map (parse-proxy-url proxy-spec)
+   (let [t-ms (int (or timeout-ms 5000))
+         proxy-map (parse-proxy-url proxy-spec)
          socket-ch (SocketChannel/open)]
      (.setOption socket-ch StandardSocketOptions/TCP_NODELAY true)
      (let [sock (.socket socket-ch)
            proxy-addr (InetSocketAddress. ^String (:host proxy-map) (int (:port proxy-map)))]
-       (.connect sock proxy-addr (int (or timeout-ms 5000))))
-     (try
-       (let [req-bytes (build-connect-request {:target-host target-host
-                                               :target-port target-port
-                                               :proxy-auth (:proxy-auth proxy-map)})
-             req-buf (ByteBuffer/wrap req-bytes)]
-         (while (.hasRemaining req-buf)
-           (.write socket-ch req-buf))
-         (let [read-buf (ByteBuffer/allocate 4096)
-               baos (ByteArrayOutputStream.)]
-           (loop []
-             (let [n (.read socket-ch read-buf)]
-               (if (neg? n)
-                 (throw (ex-info "Proxy closed connection during CONNECT handshake" {:status :error :http-status 0}))
-                 (do
-                   (.flip read-buf)
-                   (let [bytes-read (byte-array (.remaining read-buf))]
-                     (.get read-buf bytes-read)
-                     (.write baos bytes-read 0 (alength bytes-read)))
-                   (.clear read-buf)
-                   (let [curr-bytes (.toByteArray baos)
-                         parsed (parse-connect-response curr-bytes)]
-                     (case (:status parsed)
-                       :ok
-                       (do
-                         (.configureBlocking socket-ch false)
-                         {:channel socket-ch :remaining (:remaining parsed)})
-                       :error
-                       (throw (ex-info (str "HTTP CONNECT proxy handshake failed: " (:http-status parsed) " " (:message parsed))
-                                       parsed))
-                       :incomplete
-                       (recur)))))))))
-       (catch Exception e
-         (try (.close socket-ch) (catch Exception _ nil))
-         (throw e))))))
+       (.connect sock proxy-addr t-ms)
+       (.setSoTimeout sock t-ms)
+       (try
+         (let [deadline (+ (System/currentTimeMillis) t-ms)
+               out (.getOutputStream sock)
+               in (.getInputStream sock)
+               req-bytes (build-connect-request {:target-host target-host
+                                                 :target-port target-port
+                                                 :proxy-auth (:proxy-auth proxy-map)})]
+           (.write out req-bytes)
+           (.flush out)
+           (let [buf (byte-array 4096)
+                 baos (ByteArrayOutputStream.)]
+             (loop []
+               (let [rem-ms (- deadline (System/currentTimeMillis))]
+                 (when (<= rem-ms 0)
+                   (throw (SocketTimeoutException. "Read timed out waiting for HTTP CONNECT response")))
+                 (.setSoTimeout sock (max 1 (int rem-ms)))
+                 (let [n (.read in buf 0 4096)]
+                   (if (neg? n)
+                     (throw (ex-info "Proxy closed connection during CONNECT handshake" {:status :error :http-status 0}))
+                     (do
+                       (.write baos buf 0 n)
+                       (let [curr-bytes (.toByteArray baos)
+                             parsed (parse-connect-response curr-bytes)]
+                         (case (:status parsed)
+                           :ok
+                           (do
+                             (.setSoTimeout sock 0)
+                             (.configureBlocking socket-ch false)
+                             {:channel socket-ch :remaining (:remaining parsed)})
+                           :error
+                           (throw (ex-info (str "HTTP CONNECT proxy handshake failed: " (:http-status parsed) " " (:message parsed))
+                                           parsed))
+                           :incomplete
+                           (recur))))))))))
+         (catch Exception e
+           (try (.close socket-ch) (catch Exception _ nil))
+           (throw e)))))))
