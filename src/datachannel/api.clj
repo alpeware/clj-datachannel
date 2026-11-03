@@ -40,7 +40,7 @@
      :shared-channel? false
      :callbacks (atom nil)}))
 
-(defn- apply-action!
+(defn apply-action!
   "Applies a pure action function to the state atom sequentially using a lock, extracts effects, and executes them."
   [node action-fn default-callbacks]
   (let [callbacks (or @(:callbacks node) default-callbacks)
@@ -62,38 +62,40 @@
       (when (and pure-remote-addr (not= pure-remote-addr @(:remote-addr node)))
         (reset! (:remote-addr node) pure-remote-addr)))
     (when channel
-      (if (or (:tcp? node) (instance? java.nio.channels.SocketChannel channel))
-        (doseq [buf network-out-bytes]
-          (let [pkt-bytes (cond
-                            (and (map? buf) (:packet buf))
-                            (let [p (:packet buf)]
-                              (if (instance? ByteBuffer p)
-                                (let [dup (.duplicate ^ByteBuffer p)
-                                      arr (byte-array (.remaining dup))]
-                                  (.get dup arr)
-                                  arr)
-                                p))
-                            (instance? ByteBuffer buf)
-                            (let [dup (.duplicate ^ByteBuffer buf)
-                                  arr (byte-array (.remaining dup))]
-                              (.get dup arr)
-                              arr)
-                            :else buf)]
-            (tcp/write-framed-packet! channel pkt-bytes)))
-        (doseq [buf network-out-bytes]
-          (if (and (map? buf) (:packet buf))
-            (let [{:keys [packet target]} buf
-                  dest-addr (if (string? target)
-                              (let [[ip port] (str/split target #":")]
-                                (InetSocketAddress. ^String ip (Integer/parseInt port)))
-                              (if (and (map? target) (:ip target) (:port target))
-                                (InetSocketAddress. ^String (:ip target) (Integer/parseInt (str (:port target))))
-                                target))
-                  wrapped-packet (if (instance? ByteBuffer packet) packet (ByteBuffer/wrap packet))]
-              (.send ^DatagramChannel channel ^ByteBuffer wrapped-packet dest-addr))
-            (let [dest-addr @(:remote-addr node)]
-              (when dest-addr
-                (.send ^DatagramChannel channel ^ByteBuffer buf dest-addr)))))))
+      (try
+        (if (or (:tcp? node) (instance? java.nio.channels.SocketChannel channel))
+          (doseq [buf network-out-bytes]
+            (let [pkt-bytes (cond
+                              (and (map? buf) (:packet buf))
+                              (let [p (:packet buf)]
+                                (if (instance? ByteBuffer p)
+                                  (let [dup (.duplicate ^ByteBuffer p)
+                                        arr (byte-array (.remaining dup))]
+                                    (.get dup arr)
+                                    arr)
+                                  p))
+                              (instance? ByteBuffer buf)
+                              (let [dup (.duplicate ^ByteBuffer buf)
+                                    arr (byte-array (.remaining dup))]
+                                (.get dup arr)
+                                arr)
+                              :else buf)]
+              (tcp/write-framed-packet! channel pkt-bytes)))
+          (doseq [buf network-out-bytes]
+            (if (and (map? buf) (:packet buf))
+              (let [{:keys [packet target]} buf
+                    dest-addr (if (string? target)
+                                (let [[ip port] (str/split target #":")]
+                                  (InetSocketAddress. ^String ip (Integer/parseInt port)))
+                                (if (and (map? target) (:ip target) (:port target))
+                                  (InetSocketAddress. ^String (:ip target) (Integer/parseInt (str (:port target))))
+                                  target))
+                    wrapped-packet (if (instance? ByteBuffer packet) packet (ByteBuffer/wrap packet))]
+                (.send ^DatagramChannel channel ^ByteBuffer wrapped-packet dest-addr))
+              (let [dest-addr @(:remote-addr node)]
+                (when dest-addr
+                  (.send ^DatagramChannel channel ^ByteBuffer buf dest-addr))))))
+        (catch Exception _ nil)))
     (doseq [evt app-events]
       (case (:type evt)
         :on-message (when-let [cb (:on-message callbacks)]
@@ -247,6 +249,17 @@
   (apply-action! node
                  (fn [st]
                    (datachannel.core/handle-event st {:type :add-remote-candidate :ip ip :port port} (System/currentTimeMillis)))
+                 {}))
+
+(defn set-remote-ice-credentials!
+  "Populates remote ICE credentials (:remote-ice-ufrag and :remote-ice-pwd) on a connected or listener child node."
+  [node ufrag pwd]
+  (apply-action! node
+                 (fn [st]
+                   (dc/handle-event st {:type :set-remote-ice-credentials
+                                        :remote-ice-ufrag ufrag
+                                        :remote-ice-pwd pwd}
+                                    (System/currentTimeMillis)))
                  {}))
 
 (defn create-data-channel!

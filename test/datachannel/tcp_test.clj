@@ -425,7 +425,9 @@
                   (let [client (.accept server-sock)
                         in (.getInputStream client)
                         buf (byte-array 1024)]
-                    (.read in buf 0 1024)))
+                    (.read in buf 0 1024)
+                    (while @running?
+                      (Thread/sleep 20))))
                 (catch Exception _ nil)))
           t0 (System/currentTimeMillis)]
       (try

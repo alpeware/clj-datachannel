@@ -303,6 +303,12 @@
       {:new-state (assoc state :state :shutdown-pending) :app-events [{:type :on-closing}]})
     {:new-state state :app-events []}))
 
+(defmethod handle-event-type :set-remote-ice-credentials [state event _now-ms]
+  {:new-state (cond-> state
+                (:remote-ice-ufrag event) (assoc :remote-ice-ufrag (:remote-ice-ufrag event))
+                (:remote-ice-pwd event) (assoc :remote-ice-pwd (:remote-ice-pwd event)))
+   :app-events []})
+
 (defmethod handle-event-type :default [state _event _now-ms]
   {:new-state state :app-events []})
 
