@@ -200,16 +200,20 @@
 
 (defmethod handle-timeout-timer :stun/keepalive [state _timer-id now-ms]
   (let [gathering-complete? (= (:ice-gathering-state state) :complete)
-        last-rcv (get state :last-stun-received now-ms)
+        last-activity (max (long (or (:last-any-traffic state) 0))
+                           (long (or (:last-stun-received state) now-ms)))
+        idle-timeout-ms (if (= (:state state) :established) 60000 30000)
         disconnected? (and (= (:ice-connection-state state) :connected)
-                           (> (- now-ms last-rcv) 30000))
+                           (> (- now-ms last-activity) idle-timeout-ms))
         new-state (-> state
                       (assoc-in [:timers :stun/keepalive] {:expires-at (+ now-ms 15000)})
                       (cond-> (not gathering-complete?) (assoc :ice-gathering-state :complete))
-                      (cond-> disconnected? (assoc :ice-connection-state :disconnected)))
+                      (cond-> disconnected? (assoc :ice-connection-state :disconnected
+                                                   :state :closed)))
         app-events (cond-> []
                      (not gathering-complete?) (conj {:type :on-ice-gathering-state-change :state :complete})
-                     disconnected? (conj {:type :on-ice-connection-state-change :state :disconnected}))
+                     disconnected? (conj {:type :on-ice-connection-state-change :state :disconnected}
+                                         {:type :on-close :cause :ice-keepalive-timeout}))
         network-out (if (:ice-lite? state)
                       []
                       (if (and (:remote-ice-ufrag state) (:remote-ice-pwd state))

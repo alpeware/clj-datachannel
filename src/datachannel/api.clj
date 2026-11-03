@@ -314,6 +314,55 @@
     (reset! (:selector node) nil)
     (reset! (:loop-future node) nil)))
 
+(defn should-reap-child?
+  "Pure predicate evaluating whether a child connection should be reaped based on state and activity."
+  [st now-ms]
+  (let [last-activity (max (long (or (:last-any-traffic st) 0))
+                           (long (or (:last-stun-received st) 0)))
+        established? (= (:state st) :established)
+        idle-ms (- now-ms last-activity)]
+    (boolean
+     (or (= (:state st) :closed)
+         (= (:ice-connection-state st) :failed)
+         (and (= (:ice-connection-state st) :disconnected)
+              (not established?))
+         (and (not established?)
+              (not= (:ice-connection-state st) :connected)
+              (> idle-ms 30000))
+         (> idle-ms 60000)))))
+
+(defn reap-expired-children!
+  "Reaps inactive, closed, or dead child nodes from the routing table and executes explicit on-close notification and abort."
+  [routing-table now-ms]
+  (let [to-reap (keep (fn [[k child]]
+                        (when (should-reap-child? @(:state-atom child) now-ms)
+                          [k child]))
+                      @routing-table)]
+    (when (seq to-reap)
+      (swap! routing-table
+             (fn [rt]
+               (apply dissoc rt (map first to-reap))))
+      (doseq [[_ child] to-reap]
+        (try
+          (reset! (:running child) false)
+          (let [curr-st @(:state-atom child)]
+            (when (not= (:state curr-st) :closed)
+              (apply-action! child
+                             (fn [st]
+                               (let [abort-pkt (when (:dtls-verified? st)
+                                                 {:src-port (:local-port st 5000)
+                                                  :dst-port (:remote-port st 5000)
+                                                  :verification-tag (:remote-ver-tag st 0)
+                                                  :chunks [{:type :abort :flags 0 :params []}]})]
+                                 {:new-state (-> st
+                                                 (assoc :state :closed
+                                                        :ice-connection-state :disconnected)
+                                                 (assoc :timers {}))
+                                  :network-out (if abort-pkt [abort-pkt] [])
+                                  :app-events [{:type :on-close :cause :reaper-timeout}]}))
+                             @(:callbacks child))))
+          (catch Exception _ nil))))))
+
 (defn- listen-loop-body
   "Processes a single iteration of the multiplexed listen loop, handling IO, pure core logic, and routing to callbacks."
   [opts cert-data ice-creds channel selector routing-table listener-callbacks]
@@ -326,18 +375,7 @@
 
           ;; Background reaper for routing-table (every 10 seconds)
           (when (> (- now-ms @last-reap-time) 10000)
-            (swap! routing-table
-                   (fn [rt]
-                     (into {} (remove (fn [[_ child]]
-                                        (let [st @(:state-atom child)
-                                              last-stun (get st :last-stun-received 0)]
-                                          (or (= (:state st) :closed)
-                                              (= (:ice-connection-state st) :disconnected)
-                                              (= (:ice-connection-state st) :failed)
-                                              (and (not= (:ice-connection-state st) :connected)
-                                                   (> (- now-ms last-stun) 30000))
-                                              (> (- now-ms last-stun) 60000))))
-                                      rt))))
+            (reap-expired-children! routing-table now-ms)
             (reset! last-reap-time now-ms))
 
           (when (> ready-channels 0)
@@ -631,20 +669,39 @@
 (defn- reap-tcp-connections!
   "Reaps inactive or closed client connections from routing table."
   [routing-table now-ms]
-  (swap! routing-table
-         (fn [rt]
-           (into {} (remove (fn [[ch child]]
-                              (let [st @(:state-atom child)
-                                    last-activity (or (get st :last-stun-received) 0)
-                                    dead? (or (not (.isOpen ^SocketChannel ch))
-                                              (= (:state st) :closed)
-                                              (= (:ice-connection-state st) :disconnected)
-                                              (= (:ice-connection-state st) :failed)
-                                              (> (- now-ms last-activity) 60000))]
-                                (when dead?
-                                  (try (.close ^SocketChannel ch) (catch Exception _ nil)))
-                                dead?))
-                            rt)))))
+  (let [to-reap (keep (fn [[ch child]]
+                        (let [st @(:state-atom child)
+                              dead? (or (not (.isOpen ^SocketChannel ch))
+                                        (should-reap-child? st now-ms))]
+                          (when dead?
+                            [ch child])))
+                      @routing-table)]
+    (when (seq to-reap)
+      (swap! routing-table
+             (fn [rt]
+               (apply dissoc rt (map first to-reap))))
+      (doseq [[ch child] to-reap]
+        (try
+          (reset! (:running child) false)
+          (let [curr-st @(:state-atom child)]
+            (when (not= (:state curr-st) :closed)
+              (apply-action! child
+                             (fn [st]
+                               (let [abort-pkt (when (:dtls-verified? st)
+                                                 {:src-port (:local-port st 5000)
+                                                  :dst-port (:remote-port st 5000)
+                                                  :verification-tag (:remote-ver-tag st 0)
+                                                  :chunks [{:type :abort :flags 0 :params []}]})]
+                                 {:new-state (-> st
+                                                 (assoc :state :closed
+                                                        :ice-connection-state :disconnected)
+                                                 (assoc :timers {}))
+                                  :network-out (if abort-pkt [abort-pkt] [])
+                                  :app-events [{:type :on-close :cause :reaper-timeout}]}))
+                             @(:callbacks child))))
+          (catch Exception _ nil)
+          (finally
+            (try (.close ^SocketChannel ch) (catch Exception _ nil))))))))
 
 (defn- tcp-listen-loop-body
   "Processes TCP multiplexed listen loop, accepting clients, deframing packets, and firing timers."

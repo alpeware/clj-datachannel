@@ -69,7 +69,8 @@
           state-with-rx (-> state
                             (update-in [:metrics :rx-packets] (fnil inc 0))
                             (assoc :remote-port (:src-port packet))
-                            (assoc :local-port (:dst-port packet)))
+                            (assoc :local-port (:dst-port packet))
+                            (assoc :last-any-traffic now-ms))
           res (loop [current-state state-with-rx
                      remaining-chunks chunks
                      app-events []]
@@ -131,14 +132,26 @@
               stun-res (stun/handle-packet buf remote-addr state)
               response (:response stun-res)
               candidate (:candidate stun-res)
+              binding-response? (boolean (:binding-response? stun-res))
+              valid-stun? (or (some? response) (some? candidate) binding-response?)
               new-candidate? (and candidate (not (contains? (:seen-candidates state) candidate)))
               became-connected? (and (not= (:ice-connection-state state) :connected)
-                                     (or response candidate))
+                                     (or response candidate binding-response?))
+              remote-ufrag (:remote-ice-ufrag stun-res)
+              peer-pwd (when remote-ufrag (get-in state [:peer-ice-pwds remote-ufrag]))
               new-state (-> state
-                            (cond-> (or response candidate) (assoc :last-stun-received now-ms))
+                            (cond-> valid-stun? (assoc :last-stun-received now-ms
+                                                       :last-any-traffic now-ms))
                             (cond-> response (assoc :remote-addr remote-addr))
+                            (cond-> (and remote-ufrag (nil? (:remote-ice-ufrag state)))
+                              (assoc :remote-ice-ufrag remote-ufrag))
+                            (cond-> (and peer-pwd (nil? (:remote-ice-pwd state)))
+                              (assoc :remote-ice-pwd peer-pwd))
                             (cond-> new-candidate? (update :seen-candidates (fnil conj #{}) candidate))
-                            (cond-> new-candidate? (update :remote-candidates (fnil conj []) candidate))
+                            (cond-> (and new-candidate? binding-response?)
+                              (update :local-candidates (fnil conj []) candidate))
+                            (cond-> (and new-candidate? (not binding-response?))
+                              (update :remote-candidates (fnil conj []) candidate))
                             (cond-> became-connected? (assoc :ice-connection-state :connected)))
               app-events (cond-> [{:type :stun-packet :payload network-bytes}]
                            new-candidate? (conj {:type :on-ice-candidate :candidate candidate})
@@ -160,7 +173,7 @@
                       out-buf (ByteBuffer/allocateDirect 65536)
                       {:keys [_status bytes]} (dtls/receive-app-data engine in-buf out-buf)]
                   (if (and bytes (pos? (alength bytes)))
-                    (let [state (assoc state :last-stun-received now-ms)
+                    (let [state (assoc state :last-stun-received now-ms :last-any-traffic now-ms)
                           sctp-buf (ByteBuffer/wrap bytes)
                           packet (sctp/decode-packet sctp-buf)]
                       (if packet
@@ -192,7 +205,7 @@
                          :network-out (if (empty? packets) [packet] (conj (vec packets) packet))
                          :app-events [{:type :on-error :message "DTLS Fingerprint Mismatch"} {:type :on-close}]})
                       ;; Verification passed (or listen mode), transition to :connected normally
-                      (let [state-verified (assoc state :dtls-verified? true :last-stun-received now-ms)
+                      (let [state-verified (assoc state :dtls-verified? true :last-stun-received now-ms :last-any-traffic now-ms)
                             conn-res (if (and (:client-mode? state-verified) (not (#{:established :cookie-wait :cookie-echoed} (:state state-verified))))
                                        (handle-event state-verified {:type :connect} now-ms)
                                        {:new-state (assoc state-verified :state :connected) :network-out [] :app-events []})
@@ -212,7 +225,7 @@
                           (if (seq (:pending-control-chunks (:new-state base-res)))
                             (packetize (:new-state base-res) (:app-events base-res) now-ms)
                             base-res))))
-                    (let [state (assoc state :last-stun-received now-ms)]
+                    (let [state (assoc state :last-stun-received now-ms :last-any-traffic now-ms)]
                       (if (and app-data (pos? (alength app-data)))
                         (let [sctp-buf (ByteBuffer/wrap app-data)
                               packet (sctp/decode-packet sctp-buf)]
@@ -237,7 +250,8 @@
 (defn create-connection
   "Initializes the flattened SCTP/ICE/DTLS pure state map with configured congestion parameters and cryptography contexts."
   [options client-mode?]
-  (let [cert-data (or (:cert-data options) (dtls/generate-cert))
+  (let [now-ms (System/currentTimeMillis)
+        cert-data (or (:cert-data options) (dtls/generate-cert))
         ctx (dtls/create-ssl-context (:cert cert-data) (:key cert-data))
         engine (dtls/create-engine ctx client-mode?)
         local-ver-tag (.nextInt secure-rand 2147483647)
@@ -245,11 +259,12 @@
     {:cookie-secret cookie-secret
      :remote-ver-tag 0
      :local-ver-tag local-ver-tag
-     :last-stun-received (System/currentTimeMillis)
+     :last-stun-received now-ms
+     :last-any-traffic now-ms
      :next-tsn 0
      :ssn 0
      :timers (merge (if (seq (get options :remote-candidates [])) {:stun/check-candidates {:expires-at 0}} {})
-                    {:stun/keepalive {:expires-at (+ (System/currentTimeMillis) 1000)}})
+                    {:stun/keepalive {:expires-at (+ now-ms 1000)}})
      :heartbeat-interval (get options :heartbeat-interval 30000)
      :heartbeat-error-count 0
      :rto-initial (get options :rto-initial 1000)
@@ -282,6 +297,7 @@
      :ice-gathering-state :new
      :ice-connection-state :new
      :seen-candidates #{}
+     :local-candidates []
      :remote-candidates (or (:remote-candidates options) [])
      :data-channels {}
      :client-mode? client-mode?

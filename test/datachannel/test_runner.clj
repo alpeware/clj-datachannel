@@ -8,6 +8,7 @@
             [datachannel.listen-integration-test]
             [datachannel.pure-p2p-integration-test]
             [datachannel.pure-p2p-mitm-integration-test]
+            [datachannel.reaper-keepalive-test]
             [datachannel.rehandshake-test]
             [datachannel.sans-io-integration-test]
             [datachannel.sctp-attempt-connect-without-cookie-test]
@@ -85,6 +86,7 @@
     'datachannel.dtls-test
     'datachannel.handshake-test
     'datachannel.rehandshake-test
+    'datachannel.reaper-keepalive-test
     'datachannel.stun-test
     'datachannel.sctp-state-machine-test
     'datachannel.sctp-establish-simultaneous-connection-test

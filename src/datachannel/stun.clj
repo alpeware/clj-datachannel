@@ -1,4 +1,5 @@
 (ns datachannel.stun
+  (:require [clojure.string :as str])
   (:import [java.nio ByteBuffer ByteOrder]
            [java.net InetSocketAddress]
            [javax.crypto Mac]
@@ -318,7 +319,23 @@
                 (if-let [password (:ice-pwd connection)]
                   (if (check-message-integrity buf start-pos msg-len password)
                     (if-let [resp (make-binding-response password tx-id peer-addr)]
-                      {:response resp}
+                      (do
+                        (.position buf start-pos)
+                        (let [parsed (parse-packet buf)
+                              u-bytes (get (:attributes parsed) ATTR_USERNAME)
+                              username-str (when u-bytes (String. ^bytes u-bytes "UTF-8"))
+                              [target-ufrag caller-ufrag] (when (and username-str (str/includes? username-str ":"))
+                                                            (str/split username-str #":" 2))
+                              conn-ufrag (:ice-ufrag connection)]
+                          (if (and (string? conn-ufrag)
+                                   (not (str/blank? conn-ufrag))
+                                   (string? target-ufrag)
+                                   (not (str/blank? target-ufrag))
+                                   (not= target-ufrag conn-ufrag))
+                            {}
+                            (cond-> {:response resp}
+                              (and caller-ufrag (not (str/blank? caller-ufrag)))
+                              (assoc :remote-ice-ufrag caller-ufrag :username username-str)))))
                       {})
                     {})
                   {})
@@ -333,8 +350,8 @@
                     (if xor-addr-bytes
                       (let [decoded (decode-xor-mapped-address xor-addr-bytes cookie)
                             candidate-str (str (.getHostAddress ^java.net.InetAddress (:address decoded)) ":" (:port decoded))]
-                        {:candidate candidate-str})
-                      {})))
+                        {:binding-response? true :mapped-address candidate-str :candidate candidate-str})
+                      {:binding-response? true})))
 
                 :else
                 {})]
