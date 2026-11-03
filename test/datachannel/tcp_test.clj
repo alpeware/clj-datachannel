@@ -419,10 +419,12 @@
     (let [proxy-port (find-free-port)
           server-sock (ServerSocket. (int proxy-port))
           running? (atom true)
+          client-sock (atom nil)
           _ (future
               (try
                 (while @running?
                   (let [client (.accept server-sock)
+                        _ (reset! client-sock client)
                         in (.getInputStream client)
                         buf (byte-array 1024)]
                     (.read in buf 0 1024)
@@ -441,4 +443,5 @@
           (is (< elapsed 800) (str "Handshake should time out quickly, took: " elapsed "ms")))
         (finally
           (reset! running? false)
+          (when-let [c @client-sock] (try (.close ^Socket c) (catch Exception _ nil)))
           (try (.close server-sock) (catch Exception _ nil)))))))

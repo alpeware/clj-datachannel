@@ -62,9 +62,9 @@
       (when (and pure-remote-addr (not= pure-remote-addr @(:remote-addr node)))
         (reset! (:remote-addr node) pure-remote-addr)))
     (when channel
-      (try
-        (if (or (:tcp? node) (instance? java.nio.channels.SocketChannel channel))
-          (doseq [buf network-out-bytes]
+      (if (or (:tcp? node) (instance? java.nio.channels.SocketChannel channel))
+        (doseq [buf network-out-bytes]
+          (try
             (let [pkt-bytes (cond
                               (and (map? buf) (:packet buf))
                               (let [p (:packet buf)]
@@ -80,22 +80,40 @@
                                 (.get dup arr)
                                 arr)
                               :else buf)]
-              (tcp/write-framed-packet! channel pkt-bytes)))
-          (doseq [buf network-out-bytes]
+              (tcp/write-framed-packet! channel pkt-bytes))
+            (catch Exception e
+              (when state-atom
+                (swap! state-atom
+                       (fn [st]
+                         (-> (or st {})
+                             (update :send-errors (fnil inc 0))
+                             (assoc :last-send-error (or (.getMessage e) (.getName (class e)))))))))))
+        (doseq [buf network-out-bytes]
+          (try
             (if (and (map? buf) (:packet buf))
               (let [{:keys [packet target]} buf
-                    dest-addr (if (string? target)
+                    dest-addr (cond
+                                (instance? java.net.SocketAddress target) target
+                                (string? target)
                                 (let [[ip port] (str/split target #":")]
                                   (InetSocketAddress. ^String ip (Integer/parseInt port)))
-                                (if (and (map? target) (:ip target) (:port target))
-                                  (InetSocketAddress. ^String (:ip target) (Integer/parseInt (str (:port target))))
-                                  target))
+                                (and (map? target) (:ip target) (:port target))
+                                (InetSocketAddress. ^String (:ip target) (Integer/parseInt (str (:port target))))
+                                :else @(:remote-addr node))
                     wrapped-packet (if (instance? ByteBuffer packet) packet (ByteBuffer/wrap packet))]
-                (.send ^DatagramChannel channel ^ByteBuffer wrapped-packet dest-addr))
+                (when dest-addr
+                  (.send ^DatagramChannel channel ^ByteBuffer wrapped-packet dest-addr)))
               (let [dest-addr @(:remote-addr node)]
                 (when dest-addr
-                  (.send ^DatagramChannel channel ^ByteBuffer buf dest-addr))))))
-        (catch Exception _ nil)))
+                  (let [wrapped (if (instance? ByteBuffer buf) buf (ByteBuffer/wrap buf))]
+                    (.send ^DatagramChannel channel ^ByteBuffer wrapped dest-addr)))))
+            (catch Exception e
+              (when state-atom
+                (swap! state-atom
+                       (fn [st]
+                         (-> (or st {})
+                             (update :send-errors (fnil inc 0))
+                             (assoc :last-send-error (or (.getMessage e) (.getName (class e)))))))))))))
     (doseq [evt app-events]
       (case (:type evt)
         :on-message (when-let [cb (:on-message callbacks)]

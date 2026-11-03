@@ -307,7 +307,7 @@
             (is (= 0x0001 (:type parsed)))))))))
 
 (deftest test-apply-action-dispatches-on-close-when-send-throws
-  (testing "apply-action! error resilience: throwing .send never suppresses app-events like :on-close"
+  (testing "apply-action! error resilience: throwing .send never suppresses app-events like :on-close and tracks :send-errors"
     (let [closed-ch (DatagramChannel/open)
           _ (.close closed-ch)
           closed-evt (atom nil)
@@ -324,5 +324,54 @@
                             :app-events [{:type :on-close :cause :forced-close}]})
                          {})
       (is (= :closed (:state @(:state-atom mock-node))))
+      (is (= 1 (:send-errors @(:state-atom mock-node))))
+      (is (some? (:last-send-error @(:state-atom mock-node))))
       (is (some? @closed-evt) ":on-close callback must have fired despite .send throwing on closed channel")
       (is (= :forced-close (:cause @closed-evt))))))
+
+(deftest test-apply-action-per-packet-catch-and-send-errors-tracking
+  (testing "apply-action! per-packet error resilience: first packet error does not abort second packet transmission and tracks :send-errors"
+    (let [receiver-ch (DatagramChannel/open)
+          _ (.bind receiver-ch (InetSocketAddress. "127.0.0.1" 0))
+          receiver-port (.getPort (.getLocalAddress receiver-ch))
+          sender-ch (DatagramChannel/open)
+          closed-evt (atom nil)
+          mock-node {:state-atom (atom (dc/create-connection {} false))
+                     :callbacks (atom {:on-close (fn [evt] (reset! closed-evt evt))})
+                     :channel (atom sender-ch)
+                     :remote-addr (atom (InetSocketAddress. "127.0.0.1" (int receiver-port)))}
+          pkt1-bad {:packet (ByteBuffer/wrap (byte-array [1 1 1]))
+                    :target {:ip "127.0.0.1" :port 70000}}
+          pkt2-good {:packet (ByteBuffer/wrap (byte-array [2 2 2]))
+                     :target {:ip "127.0.0.1" :port receiver-port}}]
+      (try
+        (api/apply-action! mock-node
+                           (fn [st]
+                             {:new-state (assoc st :state :closed)
+                              :network-out [pkt1-bad pkt2-good]
+                              :app-events [{:type :on-close :cause :test-close}]})
+                           {})
+        (let [st @(:state-atom mock-node)]
+          (is (= :closed (:state st)))
+          (is (= 1 (:send-errors st)) ":send-errors must record exactly 1 failure for pkt1")
+          (is (some? (:last-send-error st)))
+          (is (re-find #"70000" (str (:last-send-error st)))))
+        (is (some? @closed-evt) ":on-close must still fire")
+        ;; Verify packet 2 was delivered to receiver-ch despite packet 1 error
+        (let [recv-buf (ByteBuffer/allocate 32)
+              _ (.configureBlocking receiver-ch false)
+              src (loop [attempts 0]
+                    (let [addr (try (.receive receiver-ch recv-buf) (catch Exception _ nil))]
+                      (if (or addr (>= attempts 20))
+                        addr
+                        (do (Thread/sleep 10) (recur (inc attempts))))))]
+          (is (some? src) "Receiver socket must have received packet 2 despite packet 1 throwing")
+          (when src
+            (.flip recv-buf)
+            (is (= 3 (.remaining recv-buf)))
+            (let [arr (byte-array 3)]
+              (.get recv-buf arr)
+              (is (= [2 2 2] (vec arr))))))
+        (finally
+          (try (.close sender-ch) (catch Exception _ nil))
+          (try (.close receiver-ch) (catch Exception _ nil)))))))
