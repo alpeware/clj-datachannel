@@ -679,16 +679,22 @@
         (is (= turn/METHOD_CHANNEL_BIND_REQUEST (:msg-type bind2-pkt)))
         (is (true? (turn/verify-turn-message-integrity bind2-raw "alice" "turn.bitecho.org" "secret123"))))
 
-      ;; Terminal :error and :closed disarm :turn/refresh timer; :allocated schedules at :refresh-at-ms
+      ;; Terminal :error, :closed, and :expired disarm :turn/refresh timer; :allocated schedules at :refresh-at-ms
       (let [conn0 (dc/create-connection {:turn-config {:server-addr "127.0.0.1:3478" :username "u" :password "p"}} true)
             conn-err (assoc-in conn0 [:turn-client :state] :error)
             after-err (dc/handle-timeout conn-err :turn/refresh 2000 nil)
+            conn-closed (assoc-in conn0 [:turn-client :state] :closed)
+            after-closed (dc/handle-timeout conn-closed :turn/refresh 2000 nil)
+            conn-expired (assoc-in conn0 [:turn-client :state] :expired)
+            after-expired (dc/handle-timeout conn-expired :turn/refresh 2000 nil)
             conn-alloc (-> conn0
                            (assoc-in [:turn-client :state] :allocated)
                            (assoc-in [:turn-client :refresh-at-ms] 480000)
                            (assoc-in [:turn-client :expires-at-ms] 600000))
             after-alloc (dc/handle-timeout conn-alloc :turn/refresh 2000 nil)]
         (is (nil? (get-in (:new-state after-err) [:timers :turn/refresh])))
+        (is (nil? (get-in (:new-state after-closed) [:timers :turn/refresh])))
+        (is (nil? (get-in (:new-state after-expired) [:timers :turn/refresh])))
         (is (= 480000 (get-in (:new-state after-alloc) [:timers :turn/refresh :expires-at])))))))
 
 (deftest test-outbound-use-candidate-and-nomination-policy
