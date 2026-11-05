@@ -527,6 +527,41 @@
     (let [key (compute-long-term-key username realm password)]
       (finalize-turn-message buf key))))
 
+(defn make-refresh-success-response
+  "Constructs an RFC 5766 Refresh Success Response embedding LIFETIME and MESSAGE-INTEGRITY."
+  [tx-id username realm password lifetime]
+  (let [buf (ByteBuffer/allocate 1024)
+        _ (.order buf ByteOrder/BIG_ENDIAN)]
+    (put-u16 buf METHOD_REFRESH_RESPONSE)
+    (put-u16 buf 0)
+    (.putInt buf stun/magic-cookie)
+    (.put buf tx-id)
+    (append-attr-u32 buf ATTR_LIFETIME (long lifetime))
+    (let [key (when (and username realm password)
+                (compute-long-term-key username realm password))]
+      (finalize-turn-message buf key))))
+
+(defn make-turn-error-response
+  "Constructs an RFC 5766 TURN Error Response for the given error method (e.g., METHOD_ALLOCATE_ERROR) and error-code."
+  [method-error tx-id error-code & [{:keys [realm nonce]}]]
+  (let [buf (ByteBuffer/allocate 1024)
+        _ (.order buf ByteOrder/BIG_ENDIAN)
+        cls (quot (int error-code) 100)
+        num (mod (int error-code) 100)]
+    (put-u16 buf method-error)
+    (put-u16 buf 0)
+    (.putInt buf stun/magic-cookie)
+    (.put buf tx-id)
+    (put-u16 buf stun/ATTR_ERROR_CODE)
+    (put-u16 buf 4)
+    (.put buf (byte 0))
+    (.put buf (byte 0))
+    (.put buf (byte cls))
+    (.put buf (byte num))
+    (when realm (append-attr-string buf ATTR_REALM realm))
+    (when nonce (append-attr-string buf ATTR_NONCE nonce))
+    (finalize-turn-message buf nil)))
+
 ;; -----------------------------------------------------------------------------
 ;; Response Parser & Dispatcher
 ;; -----------------------------------------------------------------------------
@@ -667,13 +702,20 @@
    :nonce (:nonce opts)
    :server-addr (:server-addr opts)
    :lifetime (long (or (:lifetime opts) 600))
+   :allocated-at-ms nil
+   :expires-at-ms nil
+   :refresh-at-ms nil
+   :auth-retries 0
+   :max-auth-retries (long (or (:max-auth-retries opts) 1))
+   :next-channel-number MIN_CHANNEL_NUMBER
    :relayed-address nil
    :mapped-address nil
    :permissions #{}
    :channels {}
    :peer->channel {}
    :pending-tx {}
-   :dropped-frames 0})
+   :dropped-frames 0
+   :last-error nil})
 
 (defn start-allocation
   "Initiates TURN allocation, returning {:new-state ... :network-out [...] :events [...]}."
@@ -761,151 +803,261 @@
                     (make-send-indication peer-addr payload-bytes))]
         {:ok? true :network-out [frame]}))))
 
+(defn- normalize-peer-sock-addr ^InetSocketAddress [peer-addr]
+  (cond
+    (instance? InetSocketAddress peer-addr) peer-addr
+    (and (map? peer-addr) (:ip peer-addr) (:port peer-addr))
+    (InetSocketAddress. ^String (str (:ip peer-addr)) (int (:port peer-addr)))
+    (and (string? peer-addr) (str/includes? peer-addr ":"))
+    (let [[ip port] (str/split peer-addr #":")]
+      (InetSocketAddress. ^String ip (Integer/parseInt port)))
+    :else nil))
+
+(defn ensure-peer-relay
+  "Ensures CreatePermission and ChannelBind are requested for `peer-addr` when TURN allocation is active."
+  [client-state peer-addr]
+  (let [sock-addr (normalize-peer-sock-addr peer-addr)]
+    (if-not (and sock-addr (#{:allocated :channel-bound} (:state client-state)))
+      {:new-state client-state :network-out [] :events []}
+      (let [ip (peer-ip sock-addr)
+            peer-str (str sock-addr)
+            permitted? (peer-permitted? (:permissions client-state) sock-addr)
+            pending-perm? (some #(and (= (:action %) :create-permission)
+                                      (= (peer-ip (:peer-addr %)) ip))
+                                (vals (:pending-tx client-state)))
+            bound-ch (or (get-in client-state [:peer->channel peer-str])
+                         (get-in client-state [:peer->channel ip]))
+            pending-bind? (some #(and (= (:action %) :channel-bind)
+                                      (= (peer-ip (:peer-addr %)) ip))
+                                (vals (:pending-tx client-state)))
+            perm-res (if (or permitted? pending-perm?)
+                       {:new-state client-state :network-out [] :events []}
+                       (request-permission client-state sock-addr))
+            st1 (:new-state perm-res)
+            bind-res (if (or bound-ch pending-bind?)
+                       {:new-state st1 :network-out [] :events []}
+                       (let [ch (long (or (:next-channel-number st1) MIN_CHANNEL_NUMBER))]
+                         (if (<= ch MAX_CHANNEL_NUMBER)
+                           (let [r (request-channel-bind (assoc st1 :next-channel-number (inc ch)) ch sock-addr)]
+                             r)
+                           {:new-state st1 :network-out [] :events []})))]
+        {:new-state (:new-state bind-res)
+         :network-out (into (vec (:network-out perm-res)) (:network-out bind-res))
+         :events (into (vec (:events perm-res)) (:events bind-res))}))))
+
+(defn check-turn-expiry
+  "Checks whether the TURN allocation needs a refresh or has expired at `now-ms`.
+   Emits a Refresh Request when `now-ms >= :refresh-at-ms`, or transitions to `:expired` when `now-ms >= :expires-at-ms`."
+  [client-state now-ms]
+  (let [now (long (or now-ms (System/currentTimeMillis)))]
+    (if-not (#{:allocated :channel-bound} (:state client-state))
+      {:new-state client-state :network-out [] :events []}
+      (let [exp-at (:expires-at-ms client-state)
+            ref-at (:refresh-at-ms client-state)
+            pending-refresh? (some #(= (:action %) :refresh) (vals (:pending-tx client-state)))]
+        (cond
+          (and exp-at (>= now (long exp-at)))
+          {:new-state (-> client-state
+                          (assoc :state :expired
+                                 :last-error :allocation-expired
+                                 :permissions #{}
+                                 :channels {}
+                                 :peer->channel {}))
+           :network-out []
+           :events [{:type :turn-expired :expires-at-ms exp-at}]}
+
+          (and ref-at (>= now (long ref-at)) (not pending-refresh?))
+          (let [lt (long (or (:lifetime client-state) 600))
+                res (request-refresh client-state lt)]
+            (update res :events conj {:type :turn-refresh-scheduled :lifetime lt}))
+
+          :else
+          {:new-state client-state :network-out [] :events []})))))
+
 (defn step-turn-client
   "Pure state transition step for TURN client processing inbound network packet."
-  [client-state packet-buf-or-bytes & [_now-ms]]
-  (if (channel-data? packet-buf-or-bytes)
-    (let [{:keys [channel-number data]} (decode-channel-data packet-buf-or-bytes)
-          peer-addr (get-in client-state [:channels channel-number])]
-      (if (and peer-addr (peer-permitted? (:permissions client-state) peer-addr))
-        {:new-state client-state
-         :network-out []
-         :events [{:type :turn-data :peer-address peer-addr :channel-number channel-number :data data}]}
-        {:new-state (update client-state :dropped-frames (fnil inc 0))
-         :network-out []
-         :events [{:type :turn-drop :reason :unbound-channel :channel-number channel-number}]}))
-    (let [^ByteBuffer buf (if (instance? ByteBuffer packet-buf-or-bytes)
-                            (.duplicate ^ByteBuffer packet-buf-or-bytes)
-                            (ByteBuffer/wrap ^bytes packet-buf-or-bytes))
-          parsed (parse-turn-packet buf)]
-      (if (nil? parsed)
-        {:new-state client-state :network-out [] :events []}
-        (let [tx-k (tx-key (:tx-id parsed))
-              pending (get-in client-state [:pending-tx tx-k])
-              new-client-state (update client-state :pending-tx dissoc tx-k)]
-          (cond
-            ;; 401 Unauthorized Challenge on Allocate
-            (and (= (:msg-type parsed) METHOD_ALLOCATE_ERROR)
-                 (= (:error-code parsed) 401)
-                 (:realm parsed)
-                 (:nonce parsed))
-            (let [realm (:realm parsed)
-                  nonce (:nonce parsed)
-                  retry-tx-id (let [t (byte-array 12)] (.nextBytes secure-rand t) t)
-                  retry-tx-k (tx-key retry-tx-id)
-                  auth-alloc (make-allocate-request (:username client-state)
-                                                    realm
-                                                    (:password client-state)
-                                                    nonce
-                                                    {:tx-id retry-tx-id :lifetime (:lifetime client-state)})]
-              {:new-state (-> new-client-state
-                              (assoc :state :allocating-authenticated
-                                     :realm realm
-                                     :nonce nonce)
-                              (assoc-in [:pending-tx retry-tx-k] {:action :allocate-auth}))
-               :network-out [auth-alloc]
-               :events [{:type :turn-challenge-retry :realm realm :nonce nonce}]})
-
-        ;; Allocate Success
-            (= (:msg-type parsed) METHOD_ALLOCATE_RESPONSE)
-            (if (and (:username client-state) (:realm client-state) (:password client-state))
-              (if-not (verify-turn-message-integrity packet-buf-or-bytes (:username client-state) (:realm client-state) (:password client-state))
-                {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
-                 :network-out []
-                 :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
-                (let [st (assoc new-client-state
-                                :state :allocated
-                                :relayed-address (:relayed-address parsed)
-                                :mapped-address (:mapped-address parsed)
-                                :lifetime (or (:lifetime parsed) (:lifetime client-state)))]
-                  {:new-state st
+  [client-state packet-buf-or-bytes & [now-ms]]
+  (let [now (long (or now-ms (System/currentTimeMillis)))]
+    (if (channel-data? packet-buf-or-bytes)
+      (let [{:keys [channel-number data]} (decode-channel-data packet-buf-or-bytes)
+            peer-addr (get-in client-state [:channels channel-number])]
+        (if (and peer-addr (peer-permitted? (:permissions client-state) peer-addr))
+          {:new-state client-state
+           :network-out []
+           :events [{:type :turn-data :peer-address peer-addr :channel-number channel-number :data data}]}
+          {:new-state (update client-state :dropped-frames (fnil inc 0))
+           :network-out []
+           :events [{:type :turn-drop :reason :unbound-channel :channel-number channel-number}]}))
+      (let [^ByteBuffer buf (if (instance? ByteBuffer packet-buf-or-bytes)
+                              (.duplicate ^ByteBuffer packet-buf-or-bytes)
+                              (ByteBuffer/wrap ^bytes packet-buf-or-bytes))
+            parsed (parse-turn-packet buf)]
+        (if (nil? parsed)
+          {:new-state (update client-state :dropped-frames (fnil inc 0))
+           :network-out []
+           :events [{:type :turn-drop :reason :parse-failed}]}
+          (let [tx-k (tx-key (:tx-id parsed))
+                pending (get-in client-state [:pending-tx tx-k])
+                new-client-state (update client-state :pending-tx dissoc tx-k)
+                msg-type (:msg-type parsed)]
+            (cond
+              ;; 401 Unauthorized Challenge on Allocate (bounded retry)
+              (and (= msg-type METHOD_ALLOCATE_ERROR)
+                   (= (:error-code parsed) 401)
+                   (:realm parsed)
+                   (:nonce parsed))
+              (let [retries (long (or (:auth-retries client-state) 0))
+                    max-retries (long (or (:max-auth-retries client-state) 1))]
+                (if (and (not= (:action pending) :allocate-auth)
+                         (< retries max-retries))
+                  (let [realm (:realm parsed)
+                        nonce (:nonce parsed)
+                        retry-tx-id (let [t (byte-array 12)] (.nextBytes secure-rand t) t)
+                        retry-tx-k (tx-key retry-tx-id)
+                        auth-alloc (make-allocate-request (:username client-state)
+                                                          realm
+                                                          (:password client-state)
+                                                          nonce
+                                                          {:tx-id retry-tx-id :lifetime (:lifetime client-state)})]
+                    {:new-state (-> new-client-state
+                                    (assoc :state :allocating-authenticated
+                                           :realm realm
+                                           :nonce nonce
+                                           :auth-retries (inc retries))
+                                    (assoc-in [:pending-tx retry-tx-k] {:action :allocate-auth}))
+                     :network-out [auth-alloc]
+                     :events [{:type :turn-challenge-retry :realm realm :nonce nonce}]})
+                  {:new-state (assoc new-client-state
+                                     :state :error
+                                     :last-error :turn-auth-retry-exhausted)
                    :network-out []
-                   :events [{:type :turn-allocated
-                             :relayed-address (:relayed-address parsed)
-                             :lifetime (:lifetime parsed)}]}))
-          ;; No credentials required
-              (let [st (assoc new-client-state
-                              :state :allocated
-                              :relayed-address (:relayed-address parsed)
-                              :mapped-address (:mapped-address parsed)
-                              :lifetime (or (:lifetime parsed) (:lifetime client-state)))]
-                {:new-state st
-                 :network-out []
-                 :events [{:type :turn-allocated
-                           :relayed-address (:relayed-address parsed)
-                           :lifetime (:lifetime parsed)}]}))
+                   :events [{:type :turn-error
+                             :reason :turn-auth-retry-exhausted
+                             :error-code 401
+                             :msg-type msg-type}]}))
 
-        ;; CreatePermission Success
-            (= (:msg-type parsed) METHOD_CREATE_PERMISSION_RESPONSE)
-            (if (and (:username client-state) (:realm client-state) (:password client-state))
-              (if-not (verify-turn-message-integrity packet-buf-or-bytes (:username client-state) (:realm client-state) (:password client-state))
-                {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
+              ;; Non-401 (or unretryable) TURN Error Responses
+              (#{METHOD_ALLOCATE_ERROR
+                 METHOD_REFRESH_ERROR
+                 METHOD_CREATE_PERMISSION_ERROR
+                 METHOD_CHANNEL_BIND_ERROR} msg-type)
+              (let [err-code (:error-code parsed)
+                    action (:action pending)]
+                {:new-state (assoc new-client-state
+                                   :state :error
+                                   :last-error {:error-code err-code :msg-type msg-type :action action})
                  :network-out []
-                 :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
-                (let [peer-addr (:peer-addr pending)
-                      ip (when peer-addr (peer-ip peer-addr))
-                      st (update new-client-state :permissions (fnil conj #{}) (or ip (str peer-addr)))]
-                  {:new-state st
+                 :events [{:type :turn-error
+                           :reason :server-error
+                           :error-code err-code
+                           :msg-type msg-type
+                           :action action}]})
+
+              ;; Allocate Success
+              (= msg-type METHOD_ALLOCATE_RESPONSE)
+              (let [valid-mi? (if (and (:username client-state) (:realm client-state) (:password client-state))
+                                (verify-turn-message-integrity packet-buf-or-bytes (:username client-state) (:realm client-state) (:password client-state))
+                                true)]
+                (if-not valid-mi?
+                  {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
                    :network-out []
-                   :events [{:type :turn-permission-created :peer-address peer-addr}]}))
-              (let [peer-addr (:peer-addr pending)
-                    ip (when peer-addr (peer-ip peer-addr))
-                    st (update new-client-state :permissions (fnil conj #{}) (or ip (str peer-addr)))]
-                {:new-state st
-                 :network-out []
-                 :events [{:type :turn-permission-created :peer-address peer-addr}]}))
+                   :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
+                  (let [lt (long (or (:lifetime parsed) (:lifetime client-state) 600))
+                        exp-at (+ now (* lt 1000))
+                        ref-at (+ now (* (long (* lt 0.8)) 1000))
+                        st (assoc new-client-state
+                                  :state :allocated
+                                  :auth-retries 0
+                                  :relayed-address (:relayed-address parsed)
+                                  :mapped-address (:mapped-address parsed)
+                                  :lifetime lt
+                                  :allocated-at-ms now
+                                  :expires-at-ms exp-at
+                                  :refresh-at-ms ref-at)]
+                    {:new-state st
+                     :network-out []
+                     :events [{:type :turn-allocated
+                               :relayed-address (:relayed-address parsed)
+                               :lifetime lt
+                               :expires-at-ms exp-at
+                               :refresh-at-ms ref-at}]})))
 
-        ;; ChannelBind Success
-            (= (:msg-type parsed) METHOD_CHANNEL_BIND_RESPONSE)
-            (if (and (:username client-state) (:realm client-state) (:password client-state))
-              (if-not (verify-turn-message-integrity packet-buf-or-bytes (:username client-state) (:realm client-state) (:password client-state))
-                {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
-                 :network-out []
-                 :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
-                (let [ch (:channel-number pending)
-                      peer-addr (:peer-addr pending)
-                      ip (when peer-addr (peer-ip peer-addr))
-                      st (-> new-client-state
-                             (assoc :state :channel-bound)
-                             (assoc-in [:channels ch] peer-addr)
-                             (assoc-in [:peer->channel (str peer-addr)] ch)
-                             (cond-> ip (assoc-in [:peer->channel ip] ch))
-                             (update :permissions (fnil conj #{}) (or ip (str peer-addr))))]
-                  {:new-state st
+              ;; CreatePermission Success
+              (= msg-type METHOD_CREATE_PERMISSION_RESPONSE)
+              (let [valid-mi? (if (and (:username client-state) (:realm client-state) (:password client-state))
+                                (verify-turn-message-integrity packet-buf-or-bytes (:username client-state) (:realm client-state) (:password client-state))
+                                true)]
+                (if-not valid-mi?
+                  {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
                    :network-out []
-                   :events [{:type :turn-channel-bound :channel-number ch :peer-address peer-addr}]}))
-              (let [ch (:channel-number pending)
-                    peer-addr (:peer-addr pending)
-                    ip (when peer-addr (peer-ip peer-addr))
-                    st (-> new-client-state
-                           (assoc :state :channel-bound)
-                           (assoc-in [:channels ch] peer-addr)
-                           (assoc-in [:peer->channel (str peer-addr)] ch)
-                           (cond-> ip (assoc-in [:peer->channel ip] ch))
-                           (update :permissions (fnil conj #{}) (or ip (str peer-addr))))]
-                {:new-state st
-                 :network-out []
-                 :events [{:type :turn-channel-bound :channel-number ch :peer-address peer-addr}]}))
+                   :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
+                  (let [peer-addr (:peer-addr pending)
+                        ip (when peer-addr (peer-ip peer-addr))
+                        st (update new-client-state :permissions (fnil conj #{}) (or ip (str peer-addr)))]
+                    {:new-state st
+                     :network-out []
+                     :events [{:type :turn-permission-created :peer-address peer-addr}]})))
 
-        ;; Refresh Success
-            (= (:msg-type parsed) METHOD_REFRESH_RESPONSE)
-            (let [lt (or (:lifetime parsed) 0)
-                  st (assoc new-client-state :lifetime lt :state (if (zero? lt) :closed (:state new-client-state)))]
-              {:new-state st
+              ;; ChannelBind Success
+              (= msg-type METHOD_CHANNEL_BIND_RESPONSE)
+              (let [valid-mi? (if (and (:username client-state) (:realm client-state) (:password client-state))
+                                (verify-turn-message-integrity packet-buf-or-bytes (:username client-state) (:realm client-state) (:password client-state))
+                                true)]
+                (if-not valid-mi?
+                  {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
+                   :network-out []
+                   :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
+                  (let [ch (:channel-number pending)
+                        peer-addr (:peer-addr pending)
+                        ip (when peer-addr (peer-ip peer-addr))
+                        st (-> new-client-state
+                               (assoc :state :channel-bound)
+                               (assoc-in [:channels ch] peer-addr)
+                               (assoc-in [:peer->channel (str peer-addr)] ch)
+                               (cond-> ip (assoc-in [:peer->channel ip] ch))
+                               (update :permissions (fnil conj #{}) (or ip (str peer-addr))))]
+                    {:new-state st
+                     :network-out []
+                     :events [{:type :turn-channel-bound :channel-number ch :peer-address peer-addr}]})))
+
+              ;; Refresh Success
+              (= msg-type METHOD_REFRESH_RESPONSE)
+              (let [valid-mi? (if (and (:username client-state) (:realm client-state) (:password client-state))
+                                (verify-turn-message-integrity packet-buf-or-bytes (:username client-state) (:realm client-state) (:password client-state))
+                                true)]
+                (if-not valid-mi?
+                  {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
+                   :network-out []
+                   :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
+                  (let [lt (long (or (:lifetime parsed) 0))
+                        exp-at (if (zero? lt) now (+ now (* lt 1000)))
+                        ref-at (if (zero? lt) nil (+ now (* (long (* lt 0.8)) 1000)))
+                        st (assoc new-client-state
+                                  :lifetime lt
+                                  :allocated-at-ms (if (zero? lt) (:allocated-at-ms new-client-state) now)
+                                  :expires-at-ms exp-at
+                                  :refresh-at-ms ref-at
+                                  :state (if (zero? lt) :closed (:state new-client-state)))]
+                    {:new-state st
+                     :network-out []
+                     :events [{:type (if (zero? lt) :turn-closed :turn-refreshed)
+                               :lifetime lt
+                               :expires-at-ms exp-at
+                               :refresh-at-ms ref-at}]})))
+
+              ;; Data Indication
+              (= msg-type METHOD_DATA_INDICATION)
+              (let [peer-addr (:peer-address parsed)
+                    permitted? (peer-permitted? (:permissions client-state) peer-addr)]
+                (if permitted?
+                  {:new-state new-client-state
+                   :network-out []
+                   :events [{:type :turn-data :peer-address peer-addr :data (:data parsed)}]}
+                  {:new-state (update new-client-state :dropped-frames (fnil inc 0))
+                   :network-out []
+                   :events [{:type :turn-drop :reason :unauthorized-peer :peer-address peer-addr}]}))
+
+              :else
+              {:new-state (update new-client-state :dropped-frames (fnil inc 0))
                :network-out []
-               :events [{:type (if (zero? lt) :turn-closed :turn-refreshed) :lifetime lt}]})
-
-        ;; Data Indication
-            (= (:msg-type parsed) METHOD_DATA_INDICATION)
-            (let [peer-addr (:peer-address parsed)
-                  permitted? (peer-permitted? (:permissions client-state) peer-addr)]
-              (if permitted?
-                {:new-state new-client-state
-                 :network-out []
-                 :events [{:type :turn-data :peer-address peer-addr :data (:data parsed)}]}
-                {:new-state (update new-client-state :dropped-frames (fnil inc 0))
-                 :network-out []
-                 :events [{:type :turn-drop :reason :unauthorized-peer :peer-address peer-addr}]}))
-
-            :else
-            {:new-state new-client-state :network-out [] :events []}))))))
+               :events [{:type :turn-drop :reason :unexpected-msg-type :msg-type msg-type}]})))))))

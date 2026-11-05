@@ -3,8 +3,29 @@
             [datachannel.chunks :as chunks]
             [datachannel.dtls :as dtls]
             [datachannel.packetize :as packetize]
-            [datachannel.stun :as stun])
+            [datachannel.stun :as stun]
+            [datachannel.turn :as turn])
   (:import [java.net InetSocketAddress]))
+
+(defn resolve-candidate-target
+  "Resolves a candidate (InetSocketAddress, 'ip:port' string, or {:ip :port} map) into an InetSocketAddress."
+  [cand]
+  (cond
+    (instance? InetSocketAddress cand) cand
+    (and (map? cand) (:ip cand) (:port cand))
+    (InetSocketAddress. ^String (str (:ip cand)) (Integer/parseInt (str (:port cand))))
+    (and (string? cand) (str/includes? cand ":"))
+    (let [[ip port] (str/split cand #":")]
+      (InetSocketAddress. ^String ip (Integer/parseInt port)))
+    :else cand))
+
+(defn wrap-turn-packets
+  "Targets TURN control packets to `turn-server-addr` when configured."
+  [packets turn-server-addr]
+  (let [srv (resolve-candidate-target turn-server-addr)]
+    (if srv
+      (mapv (fn [pkt] {:packet pkt :target srv}) packets)
+      (vec packets))))
 
 (defmulti handle-timeout-timer
   "Multimethod dispatching timeouts for specific timers like `:sctp/t-delayed-sack`, `:sctp/t1-init`, and `:dtls/flight-timeout`. Returns the resulting core state transitions."
@@ -216,29 +237,57 @@
                      (not gathering-complete?) (conj {:type :on-ice-gathering-state-change :state :complete})
                      disconnected? (conj {:type :on-ice-connection-state-change :state :disconnected}
                                          {:type :on-close :cause :ice-keepalive-timeout}))
+        stun-opts {:role (or (:ice-role state) (if (:client-mode? state) :controlling :controlled))
+                   :tie-breaker (:ice-tie-breaker state)
+                   :priority (:local-priority state)
+                   :use-candidate? (and (= (or (:ice-role state) (if (:client-mode? state) :controlling :controlled)) :controlling)
+                                        (or (= (:nomination-policy state :aggressive) :aggressive)
+                                            (boolean (:nominate-on-next-check? state))))}
         network-out (if (:ice-lite? state)
                       []
                       (if (and (:remote-ice-ufrag state) (:remote-ice-pwd state))
                         (let [candidates (:remote-candidates state)]
                           (if (seq candidates)
                             (mapv (fn [cand]
-                                    (let [target (if (instance? InetSocketAddress cand)
-                                                   cand
-                                                   (if (and (string? cand) (str/includes? cand ":"))
-                                                     (let [[ip port] (str/split cand #":")]
-                                                       (InetSocketAddress. ^String ip (Integer/parseInt port)))
-                                                     cand))
-                                          req (stun/make-binding-request (:ice-ufrag state) (:remote-ice-ufrag state) (:remote-ice-pwd state))]
+                                    (let [target (resolve-candidate-target cand)
+                                          req (stun/make-binding-request (:ice-ufrag state) (:remote-ice-ufrag state) (:remote-ice-pwd state) stun-opts)]
                                       {:packet req :target target}))
                                   candidates)
                             (if (:remote-addr state)
-                              (let [req (stun/make-binding-request (:ice-ufrag state) (:remote-ice-ufrag state) (:remote-ice-pwd state))]
+                              (let [req (stun/make-binding-request (:ice-ufrag state) (:remote-ice-ufrag state) (:remote-ice-pwd state) stun-opts)]
                                 [{:packet req :target (:remote-addr state)}])
                               [])))
                         []))]
     {:new-state new-state
      :network-out network-out
      :app-events app-events}))
+
+(defmethod handle-timeout-timer :turn/refresh [state _timer-id now-ms]
+  (if-let [tc (:turn-client state)]
+    (let [turn-srv (or (:turn-server-addr state) (:server-addr tc))
+          res (cond
+                (= (:state tc) :idle)
+                (turn/start-allocation tc)
+
+                (#{:allocated :channel-bound} (:state tc))
+                (turn/check-turn-expiry tc now-ms)
+
+                :else
+                {:new-state tc :network-out [] :events []})
+          tc-new (:new-state res)
+          next-state (if (= (:state tc-new) :expired)
+                       (-> state
+                           (assoc :turn-client tc-new)
+                           (update :timers dissoc :turn/refresh))
+                       (-> state
+                           (assoc :turn-client tc-new)
+                           (assoc-in [:timers :turn/refresh] {:expires-at (+ now-ms 1000)})))]
+      {:new-state next-state
+       :network-out (wrap-turn-packets (:network-out res) turn-srv)
+       :app-events (vec (:events res))})
+    {:new-state (update state :timers dissoc :turn/refresh)
+     :network-out []
+     :app-events []}))
 
 (defmethod handle-timeout-timer :dtls/flight-timeout [state _timer-id now-ms]
   (if-let [^javax.net.ssl.SSLEngine engine (:dtls/engine state)]
@@ -317,11 +366,45 @@
                 (:remote-ice-pwd event) (assoc :remote-ice-pwd (:remote-ice-pwd event)))
    :app-events []})
 
+(defmethod handle-event-type :add-remote-candidate [state event _now-ms]
+  (let [cand (if (and (:ip event) (:port event))
+               {:ip (:ip event) :port (:port event)}
+               (:candidate event))
+        st1 (cond-> state
+              cand (update :remote-candidates (fnil conj []) cand))]
+    (if-let [tc (:turn-client st1)]
+      (let [turn-srv (or (:turn-server-addr st1) (:server-addr tc))
+            relay-res (turn/ensure-peer-relay tc (resolve-candidate-target (or cand event)))]
+        {:new-state (assoc st1 :turn-client (:new-state relay-res))
+         :network-out (wrap-turn-packets (:network-out relay-res) turn-srv)
+         :app-events (vec (:events relay-res))})
+      {:new-state st1 :network-out [] :app-events []})))
+
+(defmethod handle-event-type :nominate-candidate [state event _now-ms]
+  (let [st1 (assoc state :nominate-on-next-check? true)
+        target (or (when-let [c (:candidate event)] (resolve-candidate-target c))
+                   (when-let [c (first (:remote-candidates st1))] (resolve-candidate-target c))
+                   (:remote-addr st1))
+        stun-opts {:role (or (:ice-role st1) :controlling)
+                   :tie-breaker (:ice-tie-breaker st1)
+                   :priority (:local-priority st1)
+                   :use-candidate? true}
+        network-out (if (and target (:remote-ice-ufrag st1) (:remote-ice-pwd st1))
+                      [{:packet (stun/make-binding-request (:ice-ufrag st1) (:remote-ice-ufrag st1) (:remote-ice-pwd st1) stun-opts)
+                        :target target}]
+                      [])]
+    {:new-state st1
+     :network-out network-out
+     :app-events []}))
+
 (defmethod handle-event-type :default [state _event _now-ms]
   {:new-state state :app-events []})
 
 (defn handle-event
   "Routes application events to `handle-event-type` and feeds the resulting state transitions through the `packetize` network generation pipeline."
   [state event now-ms]
-  (let [res (handle-event-type state event now-ms)]
-    (packetize/packetize (:new-state res) (:app-events res) now-ms)))
+  (let [res (handle-event-type state event now-ms)
+        pkt-res (packetize/packetize (:new-state res) (:app-events res) now-ms)]
+    (if (seq (:network-out res))
+      (update pkt-res :network-out #(into (vec (:network-out res)) %))
+      pkt-res)))

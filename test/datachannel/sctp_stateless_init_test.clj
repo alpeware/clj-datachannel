@@ -81,5 +81,5 @@
         ;; Verify that processing an invalid COOKIE-ECHO does NOT transition the state
         ;; It should ignore the packet.
         (is (not= :established (:state state-after-invalid-cookie-echo)))
-        (is (nil? (:remote-ver-tag state-after-invalid-cookie-echo)))
+        (is (= 0 (:remote-ver-tag state-after-invalid-cookie-echo)))
         (is (empty? (:network-out res-invalid-cookie-echo)))))))

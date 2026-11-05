@@ -137,10 +137,22 @@
                                         (cb evt))
         :on-ice-candidate (when-let [cb (:on-ice-candidate callbacks)]
                             (cb evt))
+        :on-ice-candidate-nominated (when-let [cb (:on-ice-candidate-nominated callbacks)]
+                                      (cb evt))
         :on-ice-connection-state-change (when-let [cb (:on-ice-connection-state-change callbacks)]
                                           (cb evt))
         :on-ice-gathering-state-change (when-let [cb (:on-ice-gathering-state-change callbacks)]
                                          (cb evt))
+        (:turn-allocated :turn-refreshed :turn-closed :turn-expired
+                         :turn-permission-created :turn-channel-bound :turn-challenge-retry :turn-refresh-scheduled)
+        (when-let [cb (:on-turn-event callbacks)]
+          (cb evt))
+        (:turn-error :turn-auth-failed :turn-drop)
+        (do
+          (when-let [cb (:on-turn-event callbacks)]
+            (cb evt))
+          (when-let [cb (:on-error callbacks)]
+            (cb evt)))
         nil))
     (when should-notify-open?
       (when-let [cb (:on-open callbacks)]
@@ -229,10 +241,24 @@
                       (cb {:type :on-error :cause e})))))))]
       (reset! (:loop-future node) fut)
 
+      ;; If TURN is configured, kick off TURN allocation immediately
+      (when (:turn-config (:opts node))
+        (apply-action! node
+                       (fn [st]
+                         (dc/handle-timeout st :turn/refresh (System/currentTimeMillis) nil))
+                       callbacks))
+
       ;; If we are the active side, we should initiate connection
       (when client-mode?
         (future
-          (Thread/sleep 100)
+          (if (:turn-config (:opts node))
+            (loop [waited 0]
+              (when (and (< waited 1000)
+                         (not (#{:allocated :channel-bound}
+                               (get-in @(:state-atom node) [:turn-client :state]))))
+                (Thread/sleep 20)
+                (recur (+ waited 20))))
+            (Thread/sleep 100))
           (apply-action! node
                          (fn [st]
                            (dc/handle-timeout st :stun/keepalive (System/currentTimeMillis) nil))

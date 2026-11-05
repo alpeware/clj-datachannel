@@ -1,11 +1,13 @@
 (ns datachannel.ice-turn-holepunch-test
   (:require [clojure.test :refer [deftest is testing]]
+            [datachannel.api :as api]
             [datachannel.core :as dc]
             [datachannel.sdp :as sdp]
             [datachannel.stun :as stun]
             [datachannel.turn :as turn])
   (:import [java.net InetSocketAddress]
-           [java.nio ByteBuffer]))
+           [java.nio ByteBuffer]
+           [java.nio.channels DatagramChannel]))
 
 (deftest test-ice-candidate-priority-and-pairing
   (testing "RFC 8445 §5.1.2 Candidate Priority calculation"
@@ -521,3 +523,302 @@
         (is (true? (:nominated? (:new-state res)))))
       ;; Candidate nomination event emitted
       (is (some #(= :on-ice-candidate-nominated (:type %)) (:app-events res))))))
+
+(deftest test-turn-expiry-and-refresh
+  (testing "Allocation tracks refresh-at-ms (80% lifetime), emits Refresh Request, and expires when unrefreshed"
+    (let [cli0 (turn/init-turn-client {:username "alice" :password "secret123" :lifetime 100})
+          s1 (turn/start-allocation cli0)
+          req1 (turn/parse-turn-packet (first (:network-out s1)))
+          r401 (turn/make-allocate-error-response (:tx-id req1) "turn.bitecho.org" "nonce-exp")
+          s2 (turn/step-turn-client (:new-state s1) r401 1000)
+          req2 (turn/parse-turn-packet (first (:network-out s2)))
+          r-ok (turn/make-allocate-success-response (:tx-id req2) "alice" "turn.bitecho.org" "secret123"
+                                                    (InetSocketAddress. "198.51.100.10" 49160)
+                                                    (InetSocketAddress. "203.0.113.50" 54321)
+                                                    100)
+          s3 (turn/step-turn-client (:new-state s2) r-ok 1000)
+          cli-alloc (:new-state s3)]
+      (is (= :allocated (:state cli-alloc)))
+      (is (= 1000 (:allocated-at-ms cli-alloc)))
+      (is (= 101000 (:expires-at-ms cli-alloc)))
+      (is (= 81000 (:refresh-at-ms cli-alloc)))
+
+      ;; Before refresh-at-ms: no refresh emitted
+      (let [chk-early (turn/check-turn-expiry cli-alloc 50000)]
+        (is (empty? (:network-out chk-early)))
+        (is (empty? (:events chk-early))))
+
+      ;; At 81000ms (80% of 100s lifetime): Refresh Request emitted
+      (let [chk-ref (turn/check-turn-expiry cli-alloc 81000)
+            ref-pkt (first (:network-out chk-ref))
+            parsed-ref (turn/parse-turn-packet ref-pkt)]
+        (is (= 1 (count (:network-out chk-ref))))
+        (is (= turn/METHOD_REFRESH_REQUEST (:msg-type parsed-ref)))
+        (is (= :turn-refresh-scheduled (:type (first (:events chk-ref)))))
+
+        ;; Server responds with Refresh Success (lifetime 200s) at t=82000ms
+        (let [r-ref (turn/make-refresh-success-response (:tx-id parsed-ref) "alice" "turn.bitecho.org" "secret123" 200)
+              s-ref (turn/step-turn-client (:new-state chk-ref) r-ref 82000)
+              cli-refreshed (:new-state s-ref)]
+          (is (= :turn-refreshed (:type (first (:events s-ref)))))
+          (is (= 282000 (:expires-at-ms cli-refreshed)))
+          (is (= 242000 (:refresh-at-ms cli-refreshed)))
+
+          ;; If unrefreshed past expires-at-ms (282000ms): transitions to :expired
+          (let [chk-exp (turn/check-turn-expiry cli-refreshed 282000)
+                cli-exp (:new-state chk-exp)]
+            (is (= :expired (:state cli-exp)))
+            (is (= :turn-expired (:type (first (:events chk-exp)))))
+            (is (false? (:ok? (turn/send-via-turn cli-exp (InetSocketAddress. "192.0.2.1" 5000) (.getBytes "nope" "UTF-8")))))))))))
+
+(deftest test-turn-error-bounds-and-drops
+  (testing "Repeated 401 is bounded to 1 retry, non-401 errors transition to :error, and malformed/unknown packets increment dropped-frames"
+    (let [cli0 (turn/init-turn-client {:username "alice" :password "wrong-pass" :lifetime 600})
+          s1 (turn/start-allocation cli0)
+          req1 (turn/parse-turn-packet (first (:network-out s1)))
+          r401-1 (turn/make-allocate-error-response (:tx-id req1) "turn.bitecho.org" "nonce-1")
+          s2 (turn/step-turn-client (:new-state s1) r401-1 1000)
+          req2 (turn/parse-turn-packet (first (:network-out s2)))
+          ;; Second 401 in response to authenticated retry must NOT loop forever
+          r401-2 (turn/make-allocate-error-response (:tx-id req2) "turn.bitecho.org" "nonce-2")
+          s3 (turn/step-turn-client (:new-state s2) r401-2 1100)]
+      (is (= 1 (count (:network-out s2))))
+      (is (empty? (:network-out s3)))
+      (is (= :error (:state (:new-state s3))))
+      (is (= :turn-auth-retry-exhausted (:last-error (:new-state s3))))
+      (is (= :turn-error (:type (first (:events s3)))))
+      (is (= :turn-auth-retry-exhausted (:reason (first (:events s3))))))
+
+    (testing "Non-401 server error (e.g. 437 Allocation Mismatch) surfaces :turn-error"
+      (let [cli0 (turn/init-turn-client {:username "alice" :password "secret123"})
+            s1 (turn/start-allocation cli0)
+            req1 (turn/parse-turn-packet (first (:network-out s1)))
+            r437 (turn/make-turn-error-response turn/METHOD_ALLOCATE_ERROR (:tx-id req1) 437)
+            s2 (turn/step-turn-client (:new-state s1) r437 1000)]
+        (is (= :error (:state (:new-state s2))))
+        (is (= :turn-error (:type (first (:events s2)))))
+        (is (= 437 (:error-code (first (:events s2)))))))
+
+    (testing "Malformed packet and unexpected STUN/TURN message type emit counted :turn-drop"
+      (let [cli0 (turn/init-turn-client {:username "alice" :password "secret123"})
+            bad-res (turn/step-turn-client cli0 (byte-array [1 2 3]) 1000)
+            stun-req (stun/make-simple-binding-request)
+            unexp-res (turn/step-turn-client (:new-state bad-res) stun-req 1000)]
+        (is (= 1 (:dropped-frames (:new-state bad-res))))
+        (is (= :parse-failed (:reason (first (:events bad-res)))))
+        (is (= 2 (:dropped-frames (:new-state unexp-res))))
+        (is (= :unexpected-msg-type (:reason (first (:events unexp-res)))))))))
+
+(deftest test-outbound-use-candidate-and-nomination-policy
+  (testing "Outbound STUN checks emit USE-CANDIDATE under :aggressive policy and withhold until :nominate-candidate under :regular policy"
+    (let [conn-aggr (dc/create-connection {:ice-ufrag "local-u"
+                                           :ice-pwd "local-pwd-123456789012"
+                                           :remote-ice-ufrag "remote-u"
+                                           :remote-ice-pwd "remote-pwd-123456789012"
+                                           :remote-candidates [{:ip "127.0.0.1" :port 5001}]
+                                           :nomination-policy :aggressive}
+                                          true)
+          ka-aggr (dc/handle-timeout conn-aggr :stun/keepalive 1000 nil)
+          pkt-aggr (:packet (first (:network-out ka-aggr)))
+          parsed-aggr (stun/handle-packet (.duplicate ^ByteBuffer pkt-aggr)
+                                          (InetSocketAddress. "127.0.0.1" 5000)
+                                          {:ice-ufrag "remote-u" :ice-pwd "remote-pwd-123456789012"})]
+      (is (true? (:use-candidate? parsed-aggr)))
+      (is (true? (:ice-controlling parsed-aggr))))
+
+    (let [conn-reg (dc/create-connection {:ice-ufrag "local-u"
+                                          :ice-pwd "local-pwd-123456789012"
+                                          :remote-ice-ufrag "remote-u"
+                                          :remote-ice-pwd "remote-pwd-123456789012"
+                                          :remote-candidates [{:ip "127.0.0.1" :port 5001}]
+                                          :nomination-policy :regular}
+                                         true)
+          ka-reg (dc/handle-timeout conn-reg :stun/keepalive 1000 nil)
+          pkt-reg (:packet (first (:network-out ka-reg)))
+          peer-conn {:ice-ufrag "remote-u" :ice-pwd "remote-pwd-123456789012"}
+          parsed-reg (stun/handle-packet (.duplicate ^ByteBuffer pkt-reg)
+                                         (InetSocketAddress. "127.0.0.1" 5000)
+                                         peer-conn)
+          resp-buf (:response parsed-reg)
+          rx-before-nom (dc/handle-receive (:new-state ka-reg) (bb->bytes resp-buf) 1100 (InetSocketAddress. "127.0.0.1" 5001))]
+      ;; Regular policy does NOT set USE-CANDIDATE or nominate before :nominate-candidate event
+      (is (nil? (:use-candidate? parsed-reg)))
+      (is (false? (:nominated? (:new-state rx-before-nom))))
+
+      ;; Trigger :nominate-candidate event
+      (let [nom-ev (dc/handle-event (:new-state rx-before-nom) {:type :nominate-candidate} 1200)
+            pkt-nom (:packet (first (:network-out nom-ev)))
+            parsed-nom (stun/handle-packet (.duplicate ^ByteBuffer pkt-nom)
+                                           (InetSocketAddress. "127.0.0.1" 5000)
+                                           peer-conn)
+            rx-after-nom (dc/handle-receive (:new-state nom-ev) (bb->bytes (:response parsed-nom)) 1300 (InetSocketAddress. "127.0.0.1" 5001))]
+        (is (true? (:use-candidate? parsed-nom)))
+        (is (true? (:nominated? (:new-state rx-after-nom))))
+        (is (some #(= :on-ice-candidate-nominated (:type %)) (:app-events rx-after-nom)))))))
+
+(deftest test-live-udp-mock-turn-server-relay
+  (testing "Live UDP DatagramChannel mock TURN server handles 401 -> Allocate -> CreatePermission -> ChannelBind -> Refresh -> ChannelData relay via core/api"
+    (let [server-ch (doto (DatagramChannel/open)
+                      (.configureBlocking false)
+                      (.bind (InetSocketAddress. "127.0.0.1" 0)))
+          client-ch (doto (DatagramChannel/open)
+                      (.configureBlocking false)
+                      (.bind (InetSocketAddress. "127.0.0.1" 0)))
+          peer-ch (doto (DatagramChannel/open)
+                    (.configureBlocking false)
+                    (.bind (InetSocketAddress. "127.0.0.1" 0)))
+          server-port (.getPort ^InetSocketAddress (.getLocalAddress server-ch))
+          client-port (.getPort ^InetSocketAddress (.getLocalAddress client-ch))
+          peer-port (.getPort ^InetSocketAddress (.getLocalAddress peer-ch))
+          server-addr (InetSocketAddress. "127.0.0.1" server-port)
+          client-addr (InetSocketAddress. "127.0.0.1" client-port)
+          peer-addr (InetSocketAddress. "127.0.0.1" peer-port)
+          running? (atom true)
+          server-log (atom [])
+          peer-received (promise)
+          client-received (promise)
+          turn-events (atom [])
+          ;; Mock TURN server loop on real loopback UDP socket
+          server-fut (future
+                       (let [buf (ByteBuffer/allocate 65536)
+                             bound-channels (atom {})]
+                         (while @running?
+                           (.clear buf)
+                           (if-let [sender (.receive server-ch buf)]
+                             (do
+                               (.flip buf)
+                               (let [raw (bb->bytes buf)]
+                                 (if (turn/channel-data? raw)
+                                   (let [{:keys [channel-number data]} (turn/decode-channel-data raw)
+                                         target-peer (get @bound-channels channel-number peer-addr)]
+                                     (swap! server-log conj [:channel-data-from-client channel-number])
+                                     (.send server-ch (ByteBuffer/wrap data) target-peer))
+                                   (if (= (.getPort ^InetSocketAddress sender) peer-port)
+                                     ;; Traffic from peer -> wrap in ChannelData 0x4000 back to client
+                                     (let [frame (turn/encode-channel-data 0x4000 raw)]
+                                       (swap! server-log conj [:UDP-from-peer->channel-data 0x4000])
+                                       (.send server-ch (ByteBuffer/wrap frame) client-addr))
+                                     ;; TURN control traffic from client
+                                     (when-let [parsed (turn/parse-turn-packet (ByteBuffer/wrap raw))]
+                                       (swap! server-log conj [(:msg-type parsed) (some? (:nonce parsed))])
+                                       (cond
+                                         (and (= (:msg-type parsed) turn/METHOD_ALLOCATE_REQUEST)
+                                              (nil? (:nonce parsed)))
+                                         (let [resp (turn/make-allocate-error-response (:tx-id parsed) "turn.bitecho.org" "udp-nonce-1")]
+                                           (.send server-ch resp sender))
+
+                                         (and (= (:msg-type parsed) turn/METHOD_ALLOCATE_REQUEST)
+                                              (:nonce parsed))
+                                         (let [resp (turn/make-allocate-success-response
+                                                     (:tx-id parsed) "alice" "turn.bitecho.org" "secret123"
+                                                     server-addr client-addr 600)]
+                                           (.send server-ch resp sender))
+
+                                         (= (:msg-type parsed) turn/METHOD_CREATE_PERMISSION_REQUEST)
+                                         (let [resp (turn/make-create-permission-success-response
+                                                     (:tx-id parsed) "alice" "turn.bitecho.org" "secret123")]
+                                           (.send server-ch resp sender))
+
+                                         (= (:msg-type parsed) turn/METHOD_CHANNEL_BIND_REQUEST)
+                                         (let [ch (:channel-number parsed)
+                                               p (:peer-address parsed)
+                                               p-sock (InetSocketAddress. ^String (:ip p) (int (:port p)))
+                                               resp (turn/make-channel-bind-success-response
+                                                     (:tx-id parsed) "alice" "turn.bitecho.org" "secret123")]
+                                           (swap! bound-channels assoc ch p-sock)
+                                           (.send server-ch resp sender))
+
+                                         (= (:msg-type parsed) turn/METHOD_REFRESH_REQUEST)
+                                         (let [resp (turn/make-refresh-success-response
+                                                     (:tx-id parsed) "alice" "turn.bitecho.org" "secret123" 600)]
+                                           (.send server-ch resp sender))))))))
+                             (Thread/sleep 5)))))]
+      (try
+        ;; Create node wired to real UDP channel and mock TURN server via :turn-config
+        (let [node (api/create-node {:port client-port
+                                     :setup "active"
+                                     :use-turn-relay? true
+                                     :turn-config {:username "alice"
+                                                   :password "secret123"
+                                                   :server-addr server-addr
+                                                   :lifetime 600
+                                                   :force-relay? true}})
+              conn-state (dc/create-connection
+                          (merge (:opts node)
+                                 {:cert-data (:cert-data node)
+                                  :ice-ufrag "aliceU"
+                                  :ice-pwd "alicePwd1234567890123456"
+                                  :remote-ice-ufrag "peerU"
+                                  :remote-ice-pwd "peerPwd1234567890123456"
+                                  :remote-candidates [{:ip "127.0.0.1" :port peer-port}]})
+                          true)
+              callbacks {:on-turn-event (fn [evt] (swap! turn-events conj evt))}]
+          (reset! (:channel node) client-ch)
+          (reset! (:state-atom node) conn-state)
+          (reset! (:remote-addr node) peer-addr)
+          (api/set-callbacks! node callbacks)
+
+          ;; 1. Fire :turn/refresh timeout via api/apply-action! -> sends unauthenticated Allocate to server-addr
+          (api/apply-action! node #(dc/handle-timeout % :turn/refresh 1000 nil) callbacks)
+
+          ;; Pump UDP client socket for 401 -> Auth Allocate -> Allocate OK -> auto CreatePermission + ChannelBind -> Bound!
+          (let [rx-buf (ByteBuffer/allocate 65536)]
+            (loop [step 0]
+              (when (and (< step 100)
+                         (not= :channel-bound (get-in @(:state-atom node) [:turn-client :state])))
+                (.clear rx-buf)
+                (when-let [sender (.receive client-ch rx-buf)]
+                  (.flip rx-buf)
+                  (let [bytes (bb->bytes rx-buf)]
+                    (api/apply-action! node #(dc/handle-receive % bytes (+ 1000 (* step 10)) sender) callbacks)))
+                (Thread/sleep 10)
+                (recur (inc step)))))
+
+          (is (= :channel-bound (get-in @(:state-atom node) [:turn-client :state])))
+          (is (some #(= :turn-allocated (:type %)) @turn-events))
+          (is (some #(= :turn-permission-created (:type %)) @turn-events))
+          (is (some #(= :turn-channel-bound (:type %)) @turn-events))
+
+          ;; 2. Trigger STUN check from client -> automatically wrapped in ChannelData (0x4000) to TURN server -> relayed to peer-ch!
+          (api/apply-action! node #(dc/handle-timeout % :stun/keepalive 2000 nil) callbacks)
+          (let [peer-buf (ByteBuffer/allocate 65536)]
+            (loop [tries 0]
+              (when (< tries 50)
+                (.clear peer-buf)
+                (if-let [_sender (.receive peer-ch peer-buf)]
+                  (do
+                    (.flip peer-buf)
+                    (deliver peer-received (bb->bytes peer-buf)))
+                  (do (Thread/sleep 10) (recur (inc tries)))))))
+
+          (is (realized? peer-received))
+          (let [stun-at-peer (stun/handle-packet (ByteBuffer/wrap @peer-received)
+                                                 server-addr
+                                                 {:ice-ufrag "peerU" :ice-pwd "peerPwd1234567890123456"})]
+            (is (true? (:use-candidate? stun-at-peer)))
+            ;; Peer sends STUN Binding Response back to TURN server -> server wraps in ChannelData 0x4000 -> client receives & nominates!
+            (.send peer-ch (:response stun-at-peer) server-addr))
+
+          (let [rx-buf (ByteBuffer/allocate 65536)]
+            (loop [tries 0]
+              (when (and (< tries 50) (not (:nominated? @(:state-atom node))))
+                (.clear rx-buf)
+                (when-let [sender (.receive client-ch rx-buf)]
+                  (.flip rx-buf)
+                  (let [bytes (bb->bytes rx-buf)]
+                    (api/apply-action! node #(dc/handle-receive % bytes 2500 sender) callbacks)
+                    (deliver client-received true)))
+                (Thread/sleep 10)
+                (recur (inc tries)))))
+
+          (is (realized? client-received))
+          (is (= :connected (:ice-connection-state @(:state-atom node))))
+          (is (true? (:nominated? @(:state-atom node))))
+          (is (some #(= (first %) :channel-data-from-client) @server-log))
+          (is (some #(= (first %) :UDP-from-peer->channel-data) @server-log)))
+        (finally
+          (reset! running? false)
+          (future-cancel server-fut)
+          (.close server-ch)
+          (.close client-ch)
+          (.close peer-ch))))))

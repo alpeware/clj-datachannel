@@ -52,9 +52,12 @@
         (is (= state (:new-state res)))))
 
     (testing "accepts INIT chunk with verification tag 0"
-      (let [res (core/handle-sctp-packet state packet-init-valid 0)]
-        ;; It should have processed the INIT
-        (is (= 54321 (get-in res [:new-state :remote-ver-tag])))))
+      (let [res (core/handle-sctp-packet state packet-init-valid 0)
+            out-pkt (first (:network-out res))]
+        ;; Stateless INIT responds with INIT-ACK targeted at init-tag (54321) without mutating remote-ver-tag
+        (is (= 1 (count (:network-out res))))
+        (is (= 54321 (:verification-tag out-pkt)))
+        (is (= :init-ack (:type (first (:chunks out-pkt)))))))
 
     (testing "rejects INIT chunk with non-zero verification tag"
       (let [res (core/handle-sctp-packet state packet-init-invalid 0)]

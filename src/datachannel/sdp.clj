@@ -27,6 +27,10 @@
               (* local-pref 256)
               (- 256 comp))))))
 
+(def compute-candidate-priority
+  "Alias for calculate-candidate-priority per RFC 8445 §5.1.2."
+  calculate-candidate-priority)
+
 (defn calculate-pair-priority
   "Calculates candidate pair priority per RFC 8445 §6.1.2.3:
    pair-priority = 2^32 * min(G, D) + 2 * max(G, D) + (G > D ? 1 : 0)

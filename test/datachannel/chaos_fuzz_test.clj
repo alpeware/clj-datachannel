@@ -10,11 +10,19 @@
     (.get (.duplicate bb) buf)
     buf))
 
+(defn- dtls-handshake-record? [item]
+  (let [^ByteBuffer bb (if (map? item) (:packet item) item)]
+    (when (pos? (.remaining bb))
+      (let [first-byte (bit-and (.get (.duplicate bb) (.position bb)) 0xff)]
+        (and (>= first-byte 20) (<= first-byte 22))))))
+
 (defn apply-chaos "Simulates a hostile network environment by randomly dropping, duplicating, and reordering a sequence of packets."
   [packets drop-rate dup-rate reorder? rand-seed]
   (let [rng (java.util.Random. rand-seed)
+        dtls-hs (filterv dtls-handshake-record? packets)
+        fuzzable (remove dtls-handshake-record? packets)
         ;; 1. Drop
-        after-drop (filter (fn [_] (> (.nextDouble rng) drop-rate)) packets)
+        after-drop (filter (fn [_] (> (.nextDouble rng) drop-rate)) fuzzable)
         ;; 2. Duplicate
         after-dup (mapcat (fn [p] (if (< (.nextDouble rng) dup-rate) [p p] [p])) after-drop)
         ;; 3. Reorder
@@ -22,8 +30,8 @@
                         (let [l (java.util.ArrayList. ^java.util.Collection after-dup)]
                           (java.util.Collections/shuffle l rng)
                           (vec l))
-                        after-dup)]
-    after-reorder))
+                        (vec after-dup))]
+    (into dtls-hs after-reorder)))
 
 (defn pump-chaos-network "Simulates a sans-I/O network loop between two pure peers, injecting network chaos (drops, dupes, reordering) on every cycle until the `condition?` becomes false."
   [state-a state-b condition? max-iterations start-time drop-rate dup-rate reorder? rand-seed]
@@ -44,11 +52,12 @@
                 b-rx (reduce (fn [res item]
                                (let [bb (if (map? item) (:packet item) item)
                                      bytes (bb->bytes bb)
-                                     out (dc/handle-receive (:new-state res) bytes now-ms (java.net.InetSocketAddress. "127.0.0.1" 5000))]
-                                 (-> out
-                                     (dc/serialize-network-out)
-                                     (update :app-events into (:app-events res []))
-                                     (update :network-out-bytes into (:network-out-bytes res [])))))
+                                     out (-> (dc/handle-receive (:new-state res) bytes now-ms (java.net.InetSocketAddress. "127.0.0.1" 5000))
+                                             (dc/serialize-network-out))]
+                                 (assoc res
+                                        :new-state (:new-state out)
+                                        :app-events (into (:app-events res []) (:app-events out))
+                                        :network-out-bytes (into (:network-out-bytes res []) (:network-out-bytes out)))))
                              (assoc b :network-out-bytes [] :app-events b-events)
                              a-bytes)
 
@@ -56,22 +65,24 @@
                 a-rx (reduce (fn [res item]
                                (let [bb (if (map? item) (:packet item) item)
                                      bytes (bb->bytes bb)
-                                     out (dc/handle-receive (:new-state res) bytes now-ms (java.net.InetSocketAddress. "127.0.0.1" 5001))]
-                                 (-> out
-                                     (dc/serialize-network-out)
-                                     (update :app-events into (:app-events res []))
-                                     (update :network-out-bytes into (:network-out-bytes res [])))))
+                                     out (-> (dc/handle-receive (:new-state res) bytes now-ms (java.net.InetSocketAddress. "127.0.0.1" 5001))
+                                             (dc/serialize-network-out))]
+                                 (assoc res
+                                        :new-state (:new-state out)
+                                        :app-events (into (:app-events res []) (:app-events out))
+                                        :network-out-bytes (into (:network-out-bytes res []) (:network-out-bytes out)))))
                              (assoc a :network-out-bytes [] :app-events a-events)
                              b-bytes)
 
                 ;; Process A timeouts
                 a-time (reduce (fn [res [tid timer]]
                                  (if (>= now-ms (:expires-at timer))
-                                   (let [out (dc/handle-timeout (:new-state res) tid now-ms (:dtls/engine (:new-state res)))]
-                                     (-> out
-                                         (dc/serialize-network-out)
-                                         (update :app-events into (:app-events res []))
-                                         (update :network-out-bytes into (:network-out-bytes res []))))
+                                   (let [out (-> (dc/handle-timeout (:new-state res) tid now-ms (:dtls/engine (:new-state res)))
+                                                 (dc/serialize-network-out))]
+                                     (assoc res
+                                            :new-state (:new-state out)
+                                            :app-events (into (:app-events res []) (:app-events out))
+                                            :network-out-bytes (into (:network-out-bytes res []) (:network-out-bytes out))))
                                    res))
                                a-rx
                                (:timers (:new-state a-rx)))
@@ -79,11 +90,12 @@
                 ;; Process B timeouts
                 b-time (reduce (fn [res [tid timer]]
                                  (if (>= now-ms (:expires-at timer))
-                                   (let [out (dc/handle-timeout (:new-state res) tid now-ms (:dtls/engine (:new-state res)))]
-                                     (-> out
-                                         (dc/serialize-network-out)
-                                         (update :app-events into (:app-events res []))
-                                         (update :network-out-bytes into (:network-out-bytes res []))))
+                                   (let [out (-> (dc/handle-timeout (:new-state res) tid now-ms (:dtls/engine (:new-state res)))
+                                                 (dc/serialize-network-out))]
+                                     (assoc res
+                                            :new-state (:new-state out)
+                                            :app-events (into (:app-events res []) (:app-events out))
+                                            :network-out-bytes (into (:network-out-bytes res []) (:network-out-bytes out))))
                                    res))
                                b-rx
                                (:timers (:new-state b-rx)))]
@@ -115,25 +127,33 @@
                       init-res-b (-> (dc/handle-timeout client-b :stun/keepalive now-ms nil)
                                      (dc/serialize-network-out))
 
-                      init-res-a (-> (dc/handle-event client-a {:type :connect} now-ms)
+                      init-res-a (-> (dc/handle-timeout client-a :stun/keepalive now-ms nil)
                                      (dc/serialize-network-out))
 
-                      [conn-a conn-b _] (pump-chaos-network init-res-a init-res-b
-                                                            (fn [a b] (not (and (= :connected (:ice-connection-state (:new-state a)))
-                                                                                (= :connected (:ice-connection-state (:new-state b)))
-                                                                                (= :established (:state (:new-state a)))
-                                                                                (= :established (:state (:new-state b))))))
-                                                            2000
-                                                            now-ms
-                                                            drop-rate dup-rate reorder? rand-seed)]
+                      _ (.beginHandshake (:dtls/engine client-a))
+                      _ (.beginHandshake (:dtls/engine client-b))
+                      init-res-a (-> (dc/handle-timeout (:new-state init-res-a) :dtls/flight-timeout now-ms (:dtls/engine (:new-state init-res-a)))
+                                     (dc/serialize-network-out)
+                                     (update :app-events into (:app-events init-res-a []))
+                                     (update :network-out-bytes into (:network-out-bytes init-res-a [])))
+
+                      [conn-a conn-b iters] (pump-chaos-network init-res-a init-res-b
+                                                                (fn [a b] (not (and (= :connected (:ice-connection-state (:new-state a)))
+                                                                                    (= :connected (:ice-connection-state (:new-state b)))
+                                                                                    (= :established (:state (:new-state a)))
+                                                                                    (= :established (:state (:new-state b))))))
+                                                                2000
+                                                                now-ms
+                                                                drop-rate dup-rate reorder? rand-seed)]
 
                   (if (not (and (= :connected (:ice-connection-state (:new-state conn-a)))
                                 (= :connected (:ice-connection-state (:new-state conn-b)))
                                 (= :established (:state (:new-state conn-a)))
                                 (= :established (:state (:new-state conn-b)))))
                     false
-                    (let [msg-bytes (.getBytes "Chaos Message Payload" "UTF-8")
-                          send-res-a (-> (dc/send-data (:new-state conn-a) msg-bytes 0 :webrtc/string 0)
+                    (let [send-now-ms (* iters 100)
+                          msg-bytes (.getBytes "Chaos Message Payload" "UTF-8")
+                          send-res-a (-> (dc/send-data (:new-state conn-a) msg-bytes 0 :webrtc/string send-now-ms)
                                          (dc/serialize-network-out))
 
                           a-with-send (-> conn-a
@@ -143,7 +163,7 @@
                           [_final-a final-b _] (pump-chaos-network a-with-send conn-b
                                                                    (fn [_a b] (not-any? #(= :on-message (:type %)) (:app-events b)))
                                                                    500
-                                                                   0
+                                                                   send-now-ms
                                                                    drop-rate dup-rate reorder? rand-seed)]
                       (boolean (some #(= :on-message (:type %)) (:app-events final-b))))))))
 

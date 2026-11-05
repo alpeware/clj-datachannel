@@ -188,8 +188,14 @@
                     (.flip out)
                     (when (> (.remaining out) 0)
                       (.add packets (buffer->bytes out)))
-                    (if (= (.getStatus res) SSLEngineResult$Status/CLOSED)
+                    (cond
+                      (= (.getStatus res) SSLEngineResult$Status/CLOSED)
                       (throw (Exception. "SSLEngine closed during handshake"))
+
+                      (= (.getHandshakeStatus engine) SSLEngineResult$HandshakeStatus/NEED_WRAP)
+                      (recur (inc loops))
+
+                      :else
                       {:status (.getHandshakeStatus engine)
                        :packets (vec packets)
                        :app-data (.toByteArray app-data-out)})))
