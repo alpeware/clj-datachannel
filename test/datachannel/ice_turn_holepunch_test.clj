@@ -639,7 +639,57 @@
         (is (= 1 (:dropped-frames (:new-state bad-res))))
         (is (= :parse-failed (:reason (first (:events bad-res)))))
         (is (= 2 (:dropped-frames (:new-state unexp-res))))
-        (is (= :unexpected-msg-type (:reason (first (:events unexp-res)))))))))
+        (is (= :unexpected-msg-type (:reason (first (:events unexp-res)))))))
+
+    (testing "401/438 stale-nonce challenge retry on Refresh, CreatePermission, and ChannelBind + terminal :error/:closed timer disarm (R4-L1, R3-L7)"
+      (let [cli-alloc (-> (turn/init-turn-client {:username "alice" :password "secret123" :realm "turn.bitecho.org" :nonce "nonce-old"})
+                          (assoc :state :allocated))
+            ;; 1. Refresh 438 stale-nonce challenge -> retries Refresh with new nonce -> 200 resets :auth-retries to 0
+            ref1 (turn/request-refresh cli-alloc 300 {:now-ms 1000})
+            ref1-pkt (turn/parse-turn-packet (first (:network-out ref1)))
+            r438-ref (turn/make-turn-error-response turn/METHOD_REFRESH_ERROR (:tx-id ref1-pkt) 438 {:realm "turn.bitecho.org" :nonce "nonce-fresh-1"})
+            ref-retry (turn/step-turn-client (:new-state ref1) r438-ref 1100)
+            ref2-raw (first (:network-out ref-retry))
+            ref2-pkt (turn/parse-turn-packet ref2-raw)
+            r200-ref (turn/make-refresh-success-response (:tx-id ref2-pkt) "alice" "turn.bitecho.org" "secret123" 300)
+            ref-ok (turn/step-turn-client (:new-state ref-retry) r200-ref 1200)
+            ;; 2. CreatePermission 438 challenge -> retries CreatePermission with new nonce -> 200 resets :auth-retries to 0
+            perm1 (turn/request-permission (:new-state ref-ok) "192.0.2.55:5000")
+            perm1-pkt (turn/parse-turn-packet (first (:network-out perm1)))
+            r438-perm (turn/make-turn-error-response turn/METHOD_CREATE_PERMISSION_ERROR (:tx-id perm1-pkt) 438 {:realm "turn.bitecho.org" :nonce "nonce-fresh-2"})
+            perm-retry (turn/step-turn-client (:new-state perm1) r438-perm 1300)
+            perm2-raw (first (:network-out perm-retry))
+            perm2-pkt (turn/parse-turn-packet perm2-raw)
+            r200-perm (turn/make-create-permission-success-response (:tx-id perm2-pkt) "alice" "turn.bitecho.org" "secret123")
+            perm-ok (turn/step-turn-client (:new-state perm-retry) r200-perm 1400)
+            ;; 3. ChannelBind 401 challenge -> retries ChannelBind with new nonce
+            bind1 (turn/request-channel-bind (:new-state perm-ok) 0x4001 "192.0.2.55:5000")
+            bind1-pkt (turn/parse-turn-packet (first (:network-out bind1)))
+            r401-bind (turn/make-turn-error-response turn/METHOD_CHANNEL_BIND_ERROR (:tx-id bind1-pkt) 401 {:realm "turn.bitecho.org" :nonce "nonce-fresh-3"})
+            bind-retry (turn/step-turn-client (:new-state bind1) r401-bind 1500)
+            bind2-raw (first (:network-out bind-retry))
+            bind2-pkt (turn/parse-turn-packet bind2-raw)]
+        (is (= turn/METHOD_REFRESH_REQUEST (:msg-type ref2-pkt)))
+        (is (true? (turn/verify-turn-message-integrity ref2-raw "alice" "turn.bitecho.org" "secret123")))
+        (is (= :refresh (:action (first (:events ref-retry)))))
+        (is (= 0 (:auth-retries (:new-state ref-ok))))
+        (is (= turn/METHOD_CREATE_PERMISSION_REQUEST (:msg-type perm2-pkt)))
+        (is (true? (turn/verify-turn-message-integrity perm2-raw "alice" "turn.bitecho.org" "secret123")))
+        (is (= 0 (:auth-retries (:new-state perm-ok))))
+        (is (= turn/METHOD_CHANNEL_BIND_REQUEST (:msg-type bind2-pkt)))
+        (is (true? (turn/verify-turn-message-integrity bind2-raw "alice" "turn.bitecho.org" "secret123"))))
+
+      ;; Terminal :error and :closed disarm :turn/refresh timer; :allocated schedules at :refresh-at-ms
+      (let [conn0 (dc/create-connection {:turn-config {:server-addr "127.0.0.1:3478" :username "u" :password "p"}} true)
+            conn-err (assoc-in conn0 [:turn-client :state] :error)
+            after-err (dc/handle-timeout conn-err :turn/refresh 2000 nil)
+            conn-alloc (-> conn0
+                           (assoc-in [:turn-client :state] :allocated)
+                           (assoc-in [:turn-client :refresh-at-ms] 480000)
+                           (assoc-in [:turn-client :expires-at-ms] 600000))
+            after-alloc (dc/handle-timeout conn-alloc :turn/refresh 2000 nil)]
+        (is (nil? (get-in (:new-state after-err) [:timers :turn/refresh])))
+        (is (= 480000 (get-in (:new-state after-alloc) [:timers :turn/refresh :expires-at])))))))
 
 (deftest test-outbound-use-candidate-and-nomination-policy
   (testing "Outbound STUN checks emit USE-CANDIDATE under :aggressive policy and withhold until :nominate-candidate under :regular policy"

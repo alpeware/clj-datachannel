@@ -275,13 +275,18 @@
                 :else
                 {:new-state tc :network-out [] :events []})
           tc-new (:new-state res)
-          next-state (if (= (:state tc-new) :expired)
+          next-state (if (#{:expired :error :closed} (:state tc-new))
                        (-> state
                            (assoc :turn-client tc-new)
                            (update :timers dissoc :turn/refresh))
-                       (-> state
-                           (assoc :turn-client tc-new)
-                           (assoc-in [:timers :turn/refresh] {:expires-at (+ now-ms 1000)})))]
+                       (let [next-exp (if (and (#{:allocated :channel-bound} (:state tc-new))
+                                               (:refresh-at-ms tc-new)
+                                               (> (long (:refresh-at-ms tc-new)) (+ now-ms 1000)))
+                                        (long (:refresh-at-ms tc-new))
+                                        (+ now-ms 1000))]
+                         (-> state
+                             (assoc :turn-client tc-new)
+                             (assoc-in [:timers :turn/refresh] {:expires-at next-exp}))))]
       {:new-state next-state
        :network-out (wrap-turn-packets (:network-out res) turn-srv)
        :app-events (vec (:events res))})

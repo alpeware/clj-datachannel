@@ -568,58 +568,61 @@
 
 (defn parse-turn-packet
   "Parses an incoming byte buffer into a structured TURN packet map or ChannelData frame."
-  [^ByteBuffer buf]
+  [buf-or-bytes]
   (try
-    (if (channel-data? buf)
-      {:type :channel-data
-       :channel-data (decode-channel-data buf)}
-      (when (>= (.remaining buf) 20)
-        (let [start (.position buf)
-              _ (.order buf ByteOrder/BIG_ENDIAN)
-              msg-type (get-u16 buf)
-              msg-len (get-u16 buf)
-              cookie (.getInt buf)
-              tx-id (byte-array 12)
-              _ (.get buf tx-id)
-              parsed (do (.position buf start) (stun/parse-packet buf))
-              attrs (:attributes parsed)
-              realm-bytes (get attrs ATTR_REALM)
-              realm (when realm-bytes (String. ^bytes realm-bytes "UTF-8"))
-              nonce-bytes (get attrs ATTR_NONCE)
-              nonce (when nonce-bytes (String. ^bytes nonce-bytes "UTF-8"))
-              lifetime-bytes (get attrs ATTR_LIFETIME)
-              lifetime (when (and lifetime-bytes (>= (alength ^bytes lifetime-bytes) 4))
-                         (get-u32 (ByteBuffer/wrap lifetime-bytes)))
-              mapped-bytes (get attrs stun/ATTR_XOR_MAPPED_ADDRESS)
-              mapped (when mapped-bytes (decode-xor-address mapped-bytes cookie))
-              relayed-bytes (get attrs ATTR_XOR_RELAYED_ADDRESS)
-              relayed (when relayed-bytes (decode-xor-address relayed-bytes cookie))
-              peer-bytes (get attrs ATTR_XOR_PEER_ADDRESS)
-              peer (when peer-bytes (decode-xor-address peer-bytes cookie))
-              channel-bytes (get attrs ATTR_CHANNEL_NUMBER)
-              channel (when (and channel-bytes (>= (alength ^bytes channel-bytes) 2))
-                        (get-u16 (ByteBuffer/wrap channel-bytes)))
-              data-bytes (get attrs ATTR_DATA)
-              err-bytes (get attrs stun/ATTR_ERROR_CODE)
-              err-code (when (and err-bytes (>= (alength ^bytes err-bytes) 4))
-                         (let [b (ByteBuffer/wrap err-bytes)
-                               _ (.getShort b)
-                               cls (bit-and (.get b) 0xff)
-                               num (bit-and (.get b) 0xff)]
-                           (+ (* cls 100) num)))]
-          {:msg-type msg-type
-           :msg-len msg-len
-           :tx-id tx-id
-           :realm realm
-           :nonce nonce
-           :lifetime lifetime
-           :relayed-address relayed
-           :mapped-address mapped
-           :peer-address peer
-           :channel-number channel
-           :data data-bytes
-           :error-code err-code
-           :attributes attrs})))
+    (let [^ByteBuffer buf (if (instance? ByteBuffer buf-or-bytes)
+                            (.duplicate ^ByteBuffer buf-or-bytes)
+                            (ByteBuffer/wrap ^bytes buf-or-bytes))]
+      (if (channel-data? buf)
+        {:type :channel-data
+         :channel-data (decode-channel-data buf)}
+        (when (>= (.remaining buf) 20)
+          (let [start (.position buf)
+                _ (.order buf ByteOrder/BIG_ENDIAN)
+                msg-type (get-u16 buf)
+                msg-len (get-u16 buf)
+                cookie (.getInt buf)
+                tx-id (byte-array 12)
+                _ (.get buf tx-id)
+                parsed (do (.position buf start) (stun/parse-packet buf))
+                attrs (:attributes parsed)
+                realm-bytes (get attrs ATTR_REALM)
+                realm (when realm-bytes (String. ^bytes realm-bytes "UTF-8"))
+                nonce-bytes (get attrs ATTR_NONCE)
+                nonce (when nonce-bytes (String. ^bytes nonce-bytes "UTF-8"))
+                lifetime-bytes (get attrs ATTR_LIFETIME)
+                lifetime (when (and lifetime-bytes (>= (alength ^bytes lifetime-bytes) 4))
+                           (get-u32 (ByteBuffer/wrap lifetime-bytes)))
+                mapped-bytes (get attrs stun/ATTR_XOR_MAPPED_ADDRESS)
+                mapped (when mapped-bytes (decode-xor-address mapped-bytes cookie))
+                relayed-bytes (get attrs ATTR_XOR_RELAYED_ADDRESS)
+                relayed (when relayed-bytes (decode-xor-address relayed-bytes cookie))
+                peer-bytes (get attrs ATTR_XOR_PEER_ADDRESS)
+                peer (when peer-bytes (decode-xor-address peer-bytes cookie))
+                channel-bytes (get attrs ATTR_CHANNEL_NUMBER)
+                channel (when (and channel-bytes (>= (alength ^bytes channel-bytes) 2))
+                          (get-u16 (ByteBuffer/wrap channel-bytes)))
+                data-bytes (get attrs ATTR_DATA)
+                err-bytes (get attrs stun/ATTR_ERROR_CODE)
+                err-code (when (and err-bytes (>= (alength ^bytes err-bytes) 4))
+                           (let [b (ByteBuffer/wrap err-bytes)
+                                 _ (.getShort b)
+                                 cls (bit-and (.get b) 0xff)
+                                 num (bit-and (.get b) 0xff)]
+                             (+ (* cls 100) num)))]
+            {:msg-type msg-type
+             :msg-len msg-len
+             :tx-id tx-id
+             :realm realm
+             :nonce nonce
+             :lifetime lifetime
+             :relayed-address relayed
+             :mapped-address mapped
+             :peer-address peer
+             :channel-number channel
+             :data data-bytes
+             :error-code err-code
+             :attributes attrs}))))
     (catch Exception _
       nil)))
 
