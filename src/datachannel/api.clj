@@ -175,6 +175,10 @@
                             :remote-ice-ufrag (:remote-ice-ufrag remote-sdp-params)
                             :remote-ice-pwd (:remote-ice-pwd remote-sdp-params)
                             :remote-fingerprint (:fingerprint remote-sdp-params)
+                            :remote-max-message-size (or (:remote-max-message-size remote-sdp-params)
+                                                         (:max-message-size remote-sdp-params)
+                                                         (when-let [rsdp (:remote-sdp remote-sdp-params)]
+                                                           (sdp/parse-max-message-size rsdp)))
                             :remote-candidates (if (and (:ip remote-sdp-params) (:port remote-sdp-params))
                                                  [{:ip (:ip remote-sdp-params) :port (:port remote-sdp-params)}]
                                                  [])})
@@ -320,12 +324,15 @@
     @id-box))
 
 (defn set-max-message-size!
-  "Sets the maximum message size that can be sent over the connection."
-  [node max-size]
-  (apply-action! node
-                 (fn [st]
-                   (dc/set-max-message-size st max-size))
-                 {}))
+  "Sets the maximum message size that can be sent over the connection.
+   Defaults to `dc/default-max-message-size` (262144 bytes / 256 KiB) when `max-size` is omitted."
+  ([node]
+   (set-max-message-size! node dc/default-max-message-size))
+  ([node max-size]
+   (apply-action! node
+                  (fn [st]
+                    (dc/set-max-message-size st max-size))
+                  {})))
 
 (defn send!
   "Sends a message (string or byte array) to the connected peer over the given channel-id."

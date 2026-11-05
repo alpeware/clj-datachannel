@@ -3,15 +3,18 @@
             [datachannel.api :as api]))
 
 (deftest set-max-message-size-api-test
-  (testing "Calling set-max-message-size! successfully mutates the state"
+  (testing "Calling set-max-message-size! successfully mutates the state and defaults to 262144"
     (let [node (api/create-node {})
           started-node (api/start! node {:ip "127.0.0.1" :port 5002} {})]
       (try
         (let [st @(:state-atom started-node)]
-          (is (not (:max-message-size st)))
+          (is (= 262144 (:max-message-size st)))
           (api/set-max-message-size! started-node 1000)
           (let [st2 @(:state-atom started-node)]
-            (is (= 1000 (:max-message-size st2)))))
+            (is (= 1000 (:max-message-size st2))))
+          (api/set-max-message-size! started-node)
+          (let [st3 @(:state-atom started-node)]
+            (is (= 262144 (:max-message-size st3)))))
         (finally
           (api/close! started-node))))))
 

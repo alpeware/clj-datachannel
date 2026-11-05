@@ -34,7 +34,7 @@
 (defmethod handle-timeout-timer :sctp/t-delayed-sack [state _timer-id _now-ms]
   (let [sack-chunk {:type :sack
                     :cum-tsn-ack (:remote-tsn state)
-                    :a-rwnd 100000
+                    :a-rwnd (get state :a-rwnd 262144)
                     :gap-blocks (chunks/compute-gap-blocks (:remote-tsn state) (:out-of-order-tsns state))
                     :duplicate-tsns []}]
     {:new-state (-> state
@@ -333,7 +333,7 @@
         init-tsn (or initial-tsn next-tsn 0)
         init-chunk {:type :init
                     :init-tag local-ver-tag
-                    :a-rwnd 100000
+                    :a-rwnd (get state :a-rwnd 262144)
                     :outbound-streams (or local-outbound-streams 65535)
                     :inbound-streams (or local-inbound-streams 65535)
                     :initial-tsn init-tsn

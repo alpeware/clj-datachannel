@@ -19,6 +19,10 @@
   "Constant used for ByteBuffer sizing representing a reasonably large standard MTU/packet limit."
   65536)
 
+(def default-max-message-size
+  "Default WebRTC SCTP maximum message size (256 KiB)."
+  sdp/default-max-message-size)
+
 (defn get-buffered-amount
   "Calculates the total byte size of all SCTP data chunks currently enqueued for a given stream ID."
   [state stream-id]
@@ -509,6 +513,14 @@
      :client-mode? client-mode?
      :local-outbound-streams (get options :local-outbound-streams 65535)
      :local-inbound-streams (get options :local-inbound-streams 65535)
+     :max-message-size (let [local-max (long (get options :max-message-size default-max-message-size))
+                             remote-max (or (:remote-max-message-size options)
+                                            (when-let [rsdp (:remote-sdp options)]
+                                              (sdp/parse-max-message-size rsdp)))]
+                         (if (and (number? remote-max) (pos? remote-max))
+                           (min local-max (long remote-max))
+                           local-max))
+     :a-rwnd (long (get options :a-rwnd default-max-message-size))
      :max-queue-size (get options :max-queue-size)
      :max-receive-queue-size (get options :max-receive-queue-size)
      :dtls/engine engine}))
@@ -560,7 +572,7 @@
   "Accepts user application bytes, calculating fragmentation thresholds based on MTU, wrapping the sequence in correctly flagged SCTP DATA chunks, and enqueuing them to a stream's send queue."
   [state ^bytes payload stream-id protocol now-ms]
   (let [len (alength payload)
-        max-size (get state :max-message-size 65519)]
+        max-size (get state :max-message-size default-max-message-size)]
     (when (zero? len)
       (throw (ex-info "Cannot send empty message" {:type :empty-payload})))
     (when (> len max-size)

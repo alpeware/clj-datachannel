@@ -2,6 +2,19 @@
   (:require [clojure.string :as str])
   (:import [java.security SecureRandom]))
 
+(def default-max-message-size
+  "Default WebRTC SCTP maximum message size (256 KiB)."
+  262144)
+
+(defn parse-max-message-size
+  "Extracts the integer value of `a=max-message-size:<N>` from a remote SDP string, or nil if absent."
+  [sdp-str]
+  (when (string? sdp-str)
+    (when-let [[_ val-str] (re-find #"(?m)^a=max-message-size:(\d+)\r?$" sdp-str)]
+      (try
+        (Long/parseLong val-str)
+        (catch Exception _ nil)))))
+
 (def ^:private type-preferences
   {"host" 126
    "prflx" 110
@@ -132,7 +145,7 @@
        "c=IN IP4 " local-ip "\r\n"
        "a=setup:" setup "\r\n"
        "a=mid:0\r\n"
-       "a=max-message-size:100000\r\n"
+       "a=max-message-size:" default-max-message-size "\r\n"
        "a=sctp-port:5000\r\n"
        "a=fingerprint:sha-256 " fingerprint "\r\n"
        "a=ice-ufrag:" ice-ufrag "\r\n"
@@ -153,7 +166,7 @@
        "c=IN IP4 " local-ip "\r\n"
        "a=setup:" setup "\r\n"
        "a=mid:0\r\n"
-       "a=max-message-size:100000\r\n"
+       "a=max-message-size:" default-max-message-size "\r\n"
        "a=sctp-port:5000\r\n"
        "a=fingerprint:sha-256 " fingerprint "\r\n"
        "a=ice-ufrag:" ice-ufrag "\r\n"

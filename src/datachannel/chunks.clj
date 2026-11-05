@@ -83,7 +83,7 @@
     (if is-duplicate?
       (let [sack-chunk {:type :sack
                         :cum-tsn-ack remote-tsn
-                        :a-rwnd 100000
+                        :a-rwnd (get state :a-rwnd 262144)
                         :gap-blocks (compute-gap-blocks remote-tsn ooo-tsns)
                         :duplicate-tsns [tsn]}
             s1 (-> state
@@ -110,7 +110,7 @@
             s2 (if send-sack-now?
                  (let [sack-chunk {:type :sack
                                    :cum-tsn-ack (:remote-tsn s1)
-                                   :a-rwnd 100000
+                                   :a-rwnd (get s1 :a-rwnd 262144)
                                    :gap-blocks (compute-gap-blocks (:remote-tsn s1) (:out-of-order-tsns s1))
                                    :duplicate-tsns []}]
                    (-> s1
@@ -147,7 +147,7 @@
         init-ack-chunk {:type :init-ack
                         :dest-ver-tag remote-ver-tag
                         :init-tag (:local-ver-tag state)
-                        :a-rwnd 100000
+                        :a-rwnd (get state :a-rwnd 262144)
                         :outbound-streams negotiated-out
                         :inbound-streams negotiated-in
                         :initial-tsn (:next-tsn state)
@@ -416,7 +416,7 @@
     (if-not is-newer?
       (let [sack-chunk {:type :sack
                         :cum-tsn-ack remote-tsn
-                        :a-rwnd 100000
+                        :a-rwnd (get state :a-rwnd 262144)
                         :gap-blocks (compute-gap-blocks remote-tsn ooo-tsns)
                         :duplicate-tsns []}]
         {:next-state (-> state
@@ -450,7 +450,7 @@
                        (:streams chunk []))
             sack-chunk {:type :sack
                         :cum-tsn-ack (:remote-tsn s2)
-                        :a-rwnd 100000
+                        :a-rwnd (get s2 :a-rwnd 262144)
                         :gap-blocks (compute-gap-blocks (:remote-tsn s2) (:out-of-order-tsns s2))
                         :duplicate-tsns []}]
         {:next-state (-> s2

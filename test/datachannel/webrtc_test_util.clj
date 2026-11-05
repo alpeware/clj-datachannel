@@ -80,7 +80,7 @@
        "a=setup:passive\r\n"
        "a=mid:0\r\n"
        "a=sctp-port:5000\r\n"
-       "a=max-message-size:100000\r\n"
+       "a=max-message-size:262144\r\n"
        "a=fingerprint:sha-256 " fingerprint "\r\n"
        "a=ice-ufrag:" ice-ufrag "\r\n"
        "a=ice-pwd:" ice-pwd "\r\n"
