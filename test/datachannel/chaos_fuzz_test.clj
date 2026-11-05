@@ -16,7 +16,12 @@
       (let [first-byte (bit-and (.get (.duplicate bb) (.position bb)) 0xff)]
         (and (>= first-byte 20) (<= first-byte 22))))))
 
-(defn apply-chaos "Simulates a hostile network environment by randomly dropping, duplicating, and reordering a sequence of packets."
+(defn apply-chaos
+  "Simulates a hostile network environment by randomly dropping, duplicating, and reordering a sequence of packets.
+   Note: DTLS handshake records (content types 20..22) are exempted from per-datagram drop/reorder here because
+   JDK SSLEngine's DTLSv1.2 state machine requires full handshake flights to be retransmitted as a unit via
+   `:dtls/flight-timeout` rather than tolerating partial mid-flight record permutation without a reassembly buffer;
+   STUN connectivity checks and SCTP control/data packets are subjected to the full drop/dup/reorder chaos."
   [packets drop-rate dup-rate reorder? rand-seed]
   (let [rng (java.util.Random. rand-seed)
         dtls-hs (filterv dtls-handshake-record? packets)

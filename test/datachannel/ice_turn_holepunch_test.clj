@@ -564,6 +564,11 @@
           (is (= 282000 (:expires-at-ms cli-refreshed)))
           (is (= 242000 (:refresh-at-ms cli-refreshed)))
 
+          ;; If Refresh Request at 81000ms was lost in flight, check-turn-expiry retries after refresh-rto-ms (default 5000ms)
+          (let [retry-ref (turn/check-turn-expiry (:new-state chk-ref) 87000)]
+            (is (= 1 (count (:network-out retry-ref))))
+            (is (= turn/METHOD_REFRESH_REQUEST (:msg-type (turn/parse-turn-packet (first (:network-out retry-ref)))))))
+
           ;; If unrefreshed past expires-at-ms (282000ms): transitions to :expired
           (let [chk-exp (turn/check-turn-expiry cli-refreshed 282000)
                 cli-exp (:new-state chk-exp)]
@@ -572,14 +577,14 @@
             (is (false? (:ok? (turn/send-via-turn cli-exp (InetSocketAddress. "192.0.2.1" 5000) (.getBytes "nope" "UTF-8")))))))))))
 
 (deftest test-turn-error-bounds-and-drops
-  (testing "Repeated 401 is bounded to 1 retry, non-401 errors transition to :error, and malformed/unknown packets increment dropped-frames"
+  (testing "Repeated 401 is bounded to :max-auth-retries (default 1, configurable > 1), fatal errors transition to :error, per-peer errors preserve allocation, and malformed/unknown packets increment dropped-frames"
     (let [cli0 (turn/init-turn-client {:username "alice" :password "wrong-pass" :lifetime 600})
           s1 (turn/start-allocation cli0)
           req1 (turn/parse-turn-packet (first (:network-out s1)))
           r401-1 (turn/make-allocate-error-response (:tx-id req1) "turn.bitecho.org" "nonce-1")
           s2 (turn/step-turn-client (:new-state s1) r401-1 1000)
           req2 (turn/parse-turn-packet (first (:network-out s2)))
-          ;; Second 401 in response to authenticated retry must NOT loop forever
+          ;; Second 401 in response to authenticated retry must NOT loop forever when max-auth-retries=1
           r401-2 (turn/make-allocate-error-response (:tx-id req2) "turn.bitecho.org" "nonce-2")
           s3 (turn/step-turn-client (:new-state s2) r401-2 1100)]
       (is (= 1 (count (:network-out s2))))
@@ -589,7 +594,25 @@
       (is (= :turn-error (:type (first (:events s3)))))
       (is (= :turn-auth-retry-exhausted (:reason (first (:events s3))))))
 
-    (testing "Non-401 server error (e.g. 437 Allocation Mismatch) surfaces :turn-error"
+    (testing ":max-auth-retries > 1 permits stale-nonce re-challenge before exhausting"
+      (let [cli0 (turn/init-turn-client {:username "alice" :password "secret123" :max-auth-retries 2})
+            s1 (turn/start-allocation cli0)
+            req1 (turn/parse-turn-packet (first (:network-out s1)))
+            r401-1 (turn/make-allocate-error-response (:tx-id req1) "turn.bitecho.org" "nonce-1")
+            s2 (turn/step-turn-client (:new-state s1) r401-1 1000)
+            req2 (turn/parse-turn-packet (first (:network-out s2)))
+            r401-2 (turn/make-allocate-error-response (:tx-id req2) "turn.bitecho.org" "nonce-2")
+            s3 (turn/step-turn-client (:new-state s2) r401-2 1100)
+            req3 (turn/parse-turn-packet (first (:network-out s3)))
+            r401-3 (turn/make-allocate-error-response (:tx-id req3) "turn.bitecho.org" "nonce-3")
+            s4 (turn/step-turn-client (:new-state s3) r401-3 1200)]
+        (is (= 1 (count (:network-out s2))))
+        (is (= 1 (count (:network-out s3))))
+        (is (= 2 (:auth-retries (:new-state s3))))
+        (is (empty? (:network-out s4)))
+        (is (= :error (:state (:new-state s4))))))
+
+    (testing "Non-401 server error on Allocate surfaces :turn-error and transitions to :error, whereas per-peer CreatePermission error preserves :allocated state"
       (let [cli0 (turn/init-turn-client {:username "alice" :password "secret123"})
             s1 (turn/start-allocation cli0)
             req1 (turn/parse-turn-packet (first (:network-out s1)))
@@ -597,7 +620,16 @@
             s2 (turn/step-turn-client (:new-state s1) r437 1000)]
         (is (= :error (:state (:new-state s2))))
         (is (= :turn-error (:type (first (:events s2)))))
-        (is (= 437 (:error-code (first (:events s2)))))))
+        (is (= 437 (:error-code (first (:events s2))))))
+      (let [cli-alloc (-> (turn/init-turn-client {:username "alice" :password "secret123" :realm "turn.bitecho.org" :nonce "n1"})
+                          (assoc :state :allocated))
+            p-res (turn/request-permission cli-alloc "192.0.2.99:5000")
+            p-req (turn/parse-turn-packet (first (:network-out p-res)))
+            r403 (turn/make-turn-error-response turn/METHOD_CREATE_PERMISSION_ERROR (:tx-id p-req) 403)
+            s-err (turn/step-turn-client (:new-state p-res) r403 1000)]
+        (is (= :allocated (:state (:new-state s-err))))
+        (is (= :turn-error (:type (first (:events s-err)))))
+        (is (= 403 (:error-code (first (:events s-err)))))))
 
     (testing "Malformed packet and unexpected STUN/TURN message type emit counted :turn-drop"
       (let [cli0 (turn/init-turn-client {:username "alice" :password "secret123"})
@@ -654,7 +686,50 @@
             rx-after-nom (dc/handle-receive (:new-state nom-ev) (bb->bytes (:response parsed-nom)) 1300 (InetSocketAddress. "127.0.0.1" 5001))]
         (is (true? (:use-candidate? parsed-nom)))
         (is (true? (:nominated? (:new-state rx-after-nom))))
-        (is (some #(= :on-ice-candidate-nominated (:type %)) (:app-events rx-after-nom)))))))
+        (is (false? (:nominate-on-next-check? (:new-state rx-after-nom))))
+        (is (some #(= :on-ice-candidate-nominated (:type %)) (:app-events rx-after-nom)))
+        ;; Subsequent keepalive in :regular mode must NOT continue emitting USE-CANDIDATE
+        (let [ka-after (dc/handle-timeout (:new-state rx-after-nom) :stun/keepalive 1400 nil)
+              pkt-after (:packet (first (:network-out ka-after)))
+              parsed-after (stun/handle-packet (.duplicate ^ByteBuffer pkt-after)
+                                               (InetSocketAddress. "127.0.0.1" 5000)
+                                               peer-conn)]
+          (is (nil? (:use-candidate? parsed-after))))))))
+
+(deftest test-turn-default-relay-and-fail-closed-drop
+  (testing "Providing :turn-config enables :use-turn-relay? by default and drops unpermitted outbound packets instead of leaking direct traffic"
+    (let [srv (InetSocketAddress. "127.0.0.1" 3478)
+          peer (InetSocketAddress. "127.0.0.1" 5001)
+          c1 (dc/create-connection {:ice-ufrag "a" :ice-pwd "pwd-a-12345678901234"
+                                    :remote-ice-ufrag "b" :remote-ice-pwd "pwd-b-12345678901234"
+                                    :remote-candidates [{:ip "127.0.0.1" :port 5001}]
+                                    :turn-config {:username "u" :password "p" :server-addr srv}}
+                                   true)]
+      (is (true? (:use-turn-relay? c1)))
+      ;; With allocation active and permission present, outbound keepalive is encapsulated to TURN server
+      (let [c-perm (assoc c1 :turn-client {:state :allocated
+                                           :server-addr srv
+                                           :permissions #{"127.0.0.1"}
+                                           :channels {}
+                                           :peer->channel {}
+                                           :pending-tx {}
+                                           :dropped-frames 0})
+            out-perm (dc/serialize-network-out (dc/handle-timeout c-perm :stun/keepalive 1000 nil))]
+        (is (= 1 (count (:network-out-bytes out-perm))))
+        (is (= srv (:target (first (:network-out-bytes out-perm))))))
+      ;; With allocation active but NO permission for peer, outbound packet is dropped (fail-closed) with :turn-drop
+      (let [c-noperm (assoc c1 :turn-client {:state :allocated
+                                             :server-addr srv
+                                             :permissions #{}
+                                             :channels {}
+                                             :peer->channel {}
+                                             :pending-tx {}
+                                             :dropped-frames 0})
+            out-noperm (dc/serialize-network-out (dc/handle-timeout c-noperm :stun/keepalive 1000 nil))]
+        (is (empty? (:network-out-bytes out-noperm)))
+        (is (= 1 (get-in out-noperm [:new-state :turn-client :dropped-frames])))
+        (is (= :no-permission (:reason (first (filter #(= (:type %) :turn-drop) (:app-events out-noperm))))))
+        (is (= peer (:peer-address (first (filter #(= (:type %) :turn-drop) (:app-events out-noperm))))))))))
 
 (deftest test-live-udp-mock-turn-server-relay
   (testing "Live UDP DatagramChannel mock TURN server handles 401 -> Allocate -> CreatePermission -> ChannelBind -> Refresh -> ChannelData relay via core/api"
@@ -791,13 +866,15 @@
                     (deliver peer-received (bb->bytes peer-buf)))
                   (do (Thread/sleep 10) (recur (inc tries)))))))
 
-          (is (realized? peer-received))
-          (let [stun-at-peer (stun/handle-packet (ByteBuffer/wrap @peer-received)
-                                                 server-addr
-                                                 {:ice-ufrag "peerU" :ice-pwd "peerPwd1234567890123456"})]
-            (is (true? (:use-candidate? stun-at-peer)))
-            ;; Peer sends STUN Binding Response back to TURN server -> server wraps in ChannelData 0x4000 -> client receives & nominates!
-            (.send peer-ch (:response stun-at-peer) server-addr))
+          (let [peer-bytes (deref peer-received 2000 nil)]
+            (is (some? peer-bytes))
+            (when peer-bytes
+              (let [stun-at-peer (stun/handle-packet (ByteBuffer/wrap peer-bytes)
+                                                     server-addr
+                                                     {:ice-ufrag "peerU" :ice-pwd "peerPwd1234567890123456"})]
+                (is (true? (:use-candidate? stun-at-peer)))
+                ;; Peer sends STUN Binding Response back to TURN server -> server wraps in ChannelData 0x4000 -> client receives & nominates!
+                (.send peer-ch (:response stun-at-peer) server-addr))))
 
           (let [rx-buf (ByteBuffer/allocate 65536)]
             (loop [tries 0]
@@ -811,11 +888,49 @@
                 (Thread/sleep 10)
                 (recur (inc tries)))))
 
-          (is (realized? client-received))
+          (is (true? (deref client-received 2000 false)))
           (is (= :connected (:ice-connection-state @(:state-atom node))))
           (is (true? (:nominated? @(:state-atom node))))
           (is (some #(= (first %) :channel-data-from-client) @server-log))
-          (is (some #(= (first %) :UDP-from-peer->channel-data) @server-log)))
+          (is (some #(= (first %) :UDP-from-peer->channel-data) @server-log))
+
+          ;; 3. Advance past refresh-at-ms (481000ms) and verify live Refresh round-trip over UDP
+          (api/apply-action! node #(dc/handle-timeout % :turn/refresh 482000 nil) callbacks)
+          (let [rx-buf (ByteBuffer/allocate 65536)]
+            (loop [tries 0]
+              (when (and (< tries 50) (not (some #(= :turn-refreshed (:type %)) @turn-events)))
+                (.clear rx-buf)
+                (when-let [sender (.receive client-ch rx-buf)]
+                  (.flip rx-buf)
+                  (let [bytes (bb->bytes rx-buf)]
+                    (api/apply-action! node #(dc/handle-receive % bytes 482100 sender) callbacks)))
+                (Thread/sleep 10)
+                (recur (inc tries)))))
+          (is (some #(= :turn-refreshed (:type %)) @turn-events))
+
+          ;; 4. Verify api/start! automatic TURN allocation kickoff
+          (let [start-events (atom [])
+                start-node (api/create-node {:port 0
+                                             :setup "passive"
+                                             :turn-config {:username "alice"
+                                                           :password "secret123"
+                                                           :server-addr server-addr
+                                                           :lifetime 600}})]
+            (try
+              (api/start! start-node
+                          {:ip "127.0.0.1"
+                           :port peer-port
+                           :remote-ice-ufrag "peerU"
+                           :remote-ice-pwd "peerPwd1234567890123456"}
+                          {:on-turn-event #(swap! start-events conj %)})
+              (loop [w 0]
+                (when (and (< w 100)
+                           (not (some #(= :turn-allocated (:type %)) @start-events)))
+                  (Thread/sleep 10)
+                  (recur (inc w))))
+              (is (some #(= :turn-allocated (:type %)) @start-events))
+              (finally
+                (api/close! start-node)))))
         (finally
           (reset! running? false)
           (future-cancel server-fut)

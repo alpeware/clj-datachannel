@@ -776,13 +776,16 @@
   [client-state lifetime & [opts]]
   (let [tx-id (let [t (byte-array 12)] (.nextBytes secure-rand t) t)
         tx-k (tx-key tx-id)
+        now-ms (long (or (:now-ms opts) (System/currentTimeMillis)))
         req (make-refresh-request (:username client-state)
                                   (:realm client-state)
                                   (:password client-state)
                                   (:nonce client-state)
                                   lifetime
                                   (assoc opts :tx-id tx-id))
-        new-state (assoc-in client-state [:pending-tx tx-k] {:action :refresh :lifetime lifetime})]
+        new-state (assoc-in client-state [:pending-tx tx-k] {:action :refresh
+                                                             :lifetime lifetime
+                                                             :sent-at-ms now-ms})]
     {:new-state new-state
      :network-out [req]
      :events []}))
@@ -847,17 +850,27 @@
 
 (defn check-turn-expiry
   "Checks whether the TURN allocation needs a refresh or has expired at `now-ms`.
-   Emits a Refresh Request when `now-ms >= :refresh-at-ms`, or transitions to `:expired` when `now-ms >= :expires-at-ms`."
+   Emits a Refresh Request when `now-ms >= :refresh-at-ms`, retrying if an in-flight refresh
+   has exceeded `:refresh-rto-ms` (default 5000ms), or transitions to `:expired` when `now-ms >= :expires-at-ms`."
   [client-state now-ms]
   (let [now (long (or now-ms (System/currentTimeMillis)))]
     (if-not (#{:allocated :channel-bound} (:state client-state))
       {:new-state client-state :network-out [] :events []}
       (let [exp-at (:expires-at-ms client-state)
             ref-at (:refresh-at-ms client-state)
-            pending-refresh? (some #(= (:action %) :refresh) (vals (:pending-tx client-state)))]
+            refresh-rto-ms (long (or (:refresh-rto-ms client-state) 5000))
+            stale-refresh-keys (keep (fn [[k v]]
+                                       (when (and (= (:action v) :refresh)
+                                                  (>= (- now (long (or (:sent-at-ms v) 0))) refresh-rto-ms))
+                                         k))
+                                     (:pending-tx client-state))
+            cleaned-state (if (seq stale-refresh-keys)
+                            (update client-state :pending-tx #(apply dissoc % stale-refresh-keys))
+                            client-state)
+            pending-refresh? (some #(= (:action %) :refresh) (vals (:pending-tx cleaned-state)))]
         (cond
           (and exp-at (>= now (long exp-at)))
-          {:new-state (-> client-state
+          {:new-state (-> cleaned-state
                           (assoc :state :expired
                                  :last-error :allocation-expired
                                  :permissions #{}
@@ -867,12 +880,12 @@
            :events [{:type :turn-expired :expires-at-ms exp-at}]}
 
           (and ref-at (>= now (long ref-at)) (not pending-refresh?))
-          (let [lt (long (or (:lifetime client-state) 600))
-                res (request-refresh client-state lt)]
+          (let [lt (long (or (:lifetime cleaned-state) 600))
+                res (request-refresh cleaned-state lt {:now-ms now})]
             (update res :events conj {:type :turn-refresh-scheduled :lifetime lt}))
 
           :else
-          {:new-state client-state :network-out [] :events []})))))
+          {:new-state cleaned-state :network-out [] :events []})))))
 
 (defn step-turn-client
   "Pure state transition step for TURN client processing inbound network packet."
@@ -901,14 +914,14 @@
                 new-client-state (update client-state :pending-tx dissoc tx-k)
                 msg-type (:msg-type parsed)]
             (cond
-              ;; 401 Unauthorized Challenge on Allocate (bounded retry)
+              ;; 401 Unauthorized Challenge on Allocate (bounded retry up to :max-auth-retries)
               (and (= msg-type METHOD_ALLOCATE_ERROR)
                    (= (:error-code parsed) 401)
                    (:realm parsed)
                    (:nonce parsed))
               (let [retries (long (or (:auth-retries client-state) 0))
                     max-retries (long (or (:max-auth-retries client-state) 1))]
-                (if (and (not= (:action pending) :allocate-auth)
+                (if (and (#{:allocate :allocate-auth nil} (:action pending))
                          (< retries max-retries))
                   (let [realm (:realm parsed)
                         nonce (:nonce parsed)
@@ -937,15 +950,17 @@
                              :msg-type msg-type}]}))
 
               ;; Non-401 (or unretryable) TURN Error Responses
+              ;; Allocation and Refresh errors are fatal to the allocation; per-peer Permission/ChannelBind errors preserve the allocation.
               (#{METHOD_ALLOCATE_ERROR
                  METHOD_REFRESH_ERROR
                  METHOD_CREATE_PERMISSION_ERROR
                  METHOD_CHANNEL_BIND_ERROR} msg-type)
               (let [err-code (:error-code parsed)
-                    action (:action pending)]
-                {:new-state (assoc new-client-state
-                                   :state :error
-                                   :last-error {:error-code err-code :msg-type msg-type :action action})
+                    action (:action pending)
+                    fatal? (#{METHOD_ALLOCATE_ERROR METHOD_REFRESH_ERROR} msg-type)]
+                {:new-state (cond-> (assoc new-client-state
+                                           :last-error {:error-code err-code :msg-type msg-type :action action})
+                              fatal? (assoc :state :error))
                  :network-out []
                  :events [{:type :turn-error
                            :reason :server-error

@@ -108,7 +108,8 @@
         zero-checksum? (get-in new-state [:metrics :uses-zero-checksum])
         engine (:dtls/engine new-state)
         tc (:turn-client new-state)
-        use-turn? (and (:use-turn-relay? new-state)
+        use-turn? (and (or (:use-turn-relay? new-state)
+                           (:last-rx-via-turn? new-state))
                        tc
                        (#{:allocated :channel-bound} (:state tc)))
         turn-srv (when tc
@@ -136,29 +137,42 @@
                           :else
                           (throw (ex-info "Unknown item type in network-out" {:item item}))))
                       (:network-out result-map []))
-        final-out (if-not use-turn?
-                    encoded
-                    (mapv (fn [item]
-                            (let [pkt (if (and (map? item) (:packet item)) (:packet item) item)
-                                  target (when (map? item) (handlers/resolve-candidate-target (:target item)))]
-                              (if (and turn-srv (= target turn-srv))
-                                item
-                                (let [peer-addr (or target
-                                                    (handlers/resolve-candidate-target (:remote-addr new-state))
-                                                    (handlers/resolve-candidate-target (first (:remote-candidates new-state))))
-                                      raw (buf->bytes pkt)]
-                                  (if (and peer-addr raw)
-                                    (let [relayed (turn/send-via-turn tc peer-addr raw)]
-                                      (if (:ok? relayed)
-                                        (let [frame (first (:network-out relayed))
-                                              wrapped (if (instance? ByteBuffer frame) frame (ByteBuffer/wrap frame))]
-                                          (if turn-srv
-                                            {:packet wrapped :target turn-srv}
-                                            wrapped))
-                                        item))
-                                    item)))))
-                          encoded))]
-    (assoc result-map :network-out-bytes final-out)))
+        [final-out final-state final-events]
+        (if-not use-turn?
+          [encoded new-state (vec (:app-events result-map []))]
+          (reduce (fn [[out-acc st-acc evts-acc] item]
+                    (let [pkt (if (and (map? item) (:packet item)) (:packet item) item)
+                          target (when (map? item) (handlers/resolve-candidate-target (:target item)))]
+                      (if (and turn-srv (= target turn-srv))
+                        [(conj out-acc item) st-acc evts-acc]
+                        (let [peer-addr (or target
+                                            (handlers/resolve-candidate-target (:remote-addr st-acc))
+                                            (handlers/resolve-candidate-target (first (:remote-candidates st-acc))))
+                              raw (buf->bytes pkt)]
+                          (if (and peer-addr raw)
+                            (let [relayed (turn/send-via-turn (:turn-client st-acc) peer-addr raw)]
+                              (if (:ok? relayed)
+                                (let [frame (first (:network-out relayed))
+                                      wrapped (if (instance? ByteBuffer frame) frame (ByteBuffer/wrap frame))
+                                      out-item (if turn-srv {:packet wrapped :target turn-srv} wrapped)]
+                                  [(conj out-acc out-item) st-acc evts-acc])
+                                (let [reason (or (:error relayed) :turn-send-failed)
+                                      st-dropped (-> st-acc
+                                                     (update-in [:turn-client :dropped-frames] (fnil inc 0))
+                                                     (assoc-in [:turn-client :last-error] reason))
+                                      drop-evt {:type :turn-drop :reason reason :peer-address peer-addr}]
+                                  [out-acc st-dropped (conj evts-acc drop-evt)])))
+                            (let [st-dropped (-> st-acc
+                                                 (update-in [:turn-client :dropped-frames] (fnil inc 0))
+                                                 (assoc-in [:turn-client :last-error] :missing-peer-address))
+                                  drop-evt {:type :turn-drop :reason :missing-peer-address :peer-address peer-addr}]
+                              [out-acc st-dropped (conj evts-acc drop-evt)]))))))
+                  [[] new-state (vec (:app-events result-map []))]
+                  encoded))]
+    (assoc result-map
+           :new-state final-state
+           :app-events final-events
+           :network-out-bytes final-out)))
 
 (defn- process-turn-step
   [state turn-res now-ms handle-rx-fn]
@@ -180,7 +194,8 @@
                      {:tc tc-0 :out [] :evts []})
         tc-final (:tc relay-step)
         relayed-addr (:relayed-address alloc-evt)
-        relay-cand (when (and relayed-addr (:ip relayed-addr) (:port relayed-addr))
+        relay-cand (when (and (:use-turn-relay? state)
+                              relayed-addr (:ip relayed-addr) (:port relayed-addr))
                      (sdp/format-candidate {:foundation "turn1"
                                             :component 1
                                             :transport "UDP"
@@ -200,7 +215,8 @@
     (if (seq data-evts)
       (reduce (fn [acc evt]
                 (let [peer-sock (handlers/resolve-candidate-target (:peer-address evt))
-                      inner-res (handle-rx-fn (:new-state acc) (:data evt) now-ms peer-sock)]
+                      rx-state (assoc (:new-state acc) :last-rx-via-turn? true)
+                      inner-res (handle-rx-fn rx-state (:data evt) now-ms peer-sock)]
                   {:new-state (:new-state inner-res)
                    :network-out (into (:network-out acc) (:network-out inner-res))
                    :app-events (into (:app-events acc) (:app-events inner-res))}))
@@ -227,8 +243,13 @@
                 (handle-receive state (:data cd) now-ms remote-addr)
                 {:new-state state :network-out [] :app-events []})
               {:new-state state :network-out [] :app-events []}))
-          (catch Exception _
-            {:new-state state :network-out [] :app-events []}))
+          (catch Exception e
+            {:new-state (cond-> state
+                          (:turn-client state)
+                          (-> (update-in [:turn-client :dropped-frames] (fnil inc 0))
+                              (assoc-in [:turn-client :last-error] (or (.getMessage e) (.getName (class e))))))
+             :network-out []
+             :app-events [{:type :turn-error :reason :exception :message (or (.getMessage e) (.getName (class e)))}]}))
 
         ;; STUN or TURN
         (and (>= first-byte 0) (<= first-byte 3))
@@ -242,8 +263,12 @@
               (let [tc (or (:turn-client state) (turn/init-turn-client {}))
                     turn-res (turn/step-turn-client tc network-bytes now-ms)]
                 (process-turn-step state turn-res now-ms handle-receive))
-              (catch Exception _
-                {:new-state state :network-out [] :app-events []}))
+              (catch Exception e
+                {:new-state (-> state
+                                (update-in [:turn-client :dropped-frames] (fnil inc 0))
+                                (assoc-in [:turn-client :last-error] (or (.getMessage e) (.getName (class e)))))
+                 :network-out []
+                 :app-events [{:type :turn-error :reason :exception :message (or (.getMessage e) (.getName (class e)))}]}))
             (let [buf (ByteBuffer/wrap network-bytes)
                   stun-res (stun/handle-packet buf remote-addr state)
                   response (:response stun-res)
@@ -262,7 +287,11 @@
                   resolved-pwd (when (and eff-ufrag (map? peer-pwds)) (get peer-pwds eff-ufrag))
                   new-role (:new-role stun-res)
                   curr-role (or new-role (:ice-role state))
-                  local-prio (or (:local-priority state) (sdp/compute-candidate-priority :host 65535 1))
+                  relay-active? (and (or (:use-turn-relay? state) (:last-rx-via-turn? state))
+                                     (:turn-client state)
+                                     (#{:allocated :channel-bound} (get-in state [:turn-client :state])))
+                  local-prio (or (:local-priority state)
+                                 (sdp/compute-candidate-priority (if relay-active? :relay :host) 65535 1))
                   remote-prio (or (:priority stun-res) (sdp/compute-candidate-priority :host 65535 1))
                   use-candidate? (boolean (:use-candidate? stun-res))
                   nom-policy (or (:nomination-policy state) :aggressive)
@@ -298,6 +327,8 @@
                                 (cond-> (and new-candidate? (not binding-response?))
                                   (update :remote-candidates (fnil conj []) eff-cand))
                                 (cond-> nom-pair (assoc :nominated-pair nom-pair :nominated? true))
+                                (cond-> (or nom-pair (and binding-response? (:nominate-on-next-check? state)))
+                                  (assoc :nominate-on-next-check? false))
                                 (cond-> became-connected? (assoc :ice-connection-state :connected)))
                   app-events (cond-> [{:type :stun-packet :payload network-bytes}]
                                new-candidate? (conj {:type :on-ice-candidate :candidate eff-cand})
@@ -455,8 +486,11 @@
                          (sdp/compute-candidate-priority (or (:candidate-type options) :host) 65535 1))
      :turn-client (when-let [tc (:turn-config options)] (turn/init-turn-client tc))
      :turn-server-addr (when-let [tc (:turn-config options)] (handlers/resolve-candidate-target (:server-addr tc)))
-     :use-turn-relay? (boolean (or (:use-turn-relay? options)
-                                   (get-in options [:turn-config :force-relay?])))
+     :use-turn-relay? (boolean (if (contains? options :use-turn-relay?)
+                                 (:use-turn-relay? options)
+                                 (if (contains? (:turn-config options) :force-relay?)
+                                   (get-in options [:turn-config :force-relay?])
+                                   (some? (:turn-config options)))))
      :ice-gathering-state :new
      :ice-connection-state :new
      :seen-candidates #{}
