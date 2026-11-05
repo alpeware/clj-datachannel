@@ -223,14 +223,17 @@
         [a b]
         (let [a-bytes (:network-out-bytes a [])
               b-bytes (:network-out-bytes b [])
-              relay-frame (fn [^bytes raw]
+              relay-frame (fn [sender-state peer-addr ^bytes raw]
                             (if via-turn?
-                              (:data (turn/decode-channel-data (ByteBuffer/wrap (turn/encode-channel-data 0x4001 raw))))
+                              (let [tc (:turn-client (:new-state sender-state))
+                                    sent (turn/send-via-turn tc peer-addr raw)]
+                                (first (:network-out sent)))
                               raw))
               b-rx (reduce (fn [res item]
                              (let [bb (if (map? item) (:packet item) item)
-                                   bytes (relay-frame (bb->bytes bb))
-                                   out (dc/handle-receive (:new-state res) bytes now-ms (InetSocketAddress. "127.0.0.1" 5000))]
+                                   peer-a (InetSocketAddress. "127.0.0.1" 5000)
+                                   bytes (relay-frame a (InetSocketAddress. "127.0.0.1" 5001) (bb->bytes bb))
+                                   out (dc/handle-receive (:new-state res) bytes now-ms peer-a)]
                                (-> out
                                    (dc/serialize-network-out)
                                    (update :app-events into (:app-events res []))
@@ -239,8 +242,9 @@
                            a-bytes)
               a-rx (reduce (fn [res item]
                              (let [bb (if (map? item) (:packet item) item)
-                                   bytes (relay-frame (bb->bytes bb))
-                                   out (dc/handle-receive (:new-state res) bytes now-ms (InetSocketAddress. "127.0.0.1" 5001))]
+                                   peer-b (InetSocketAddress. "127.0.0.1" 5001)
+                                   bytes (relay-frame b (InetSocketAddress. "127.0.0.1" 5000) (bb->bytes bb))
+                                   out (dc/handle-receive (:new-state res) bytes now-ms peer-b)]
                                (-> out
                                    (dc/serialize-network-out)
                                    (update :app-events into (:app-events res []))
@@ -269,6 +273,26 @@
                              (:timers (:new-state b-rx)))]
           (recur a-time b-time (inc i)))))))
 
+(defn- establish-turn-channel-for-peer
+  "Runs the real TURN client state machine through Allocate -> 401 -> Auth Allocate -> Success -> ChannelBind."
+  [username password peer-addr channel-num]
+  (let [tc0 (turn/init-turn-client {:username username :password password :lifetime 600})
+        s1 (turn/start-allocation tc0)
+        req1 (turn/parse-turn-packet (first (:network-out s1)))
+        r401 (turn/make-allocate-error-response (:tx-id req1) "turn.bitecho.org" "nonce-e2e")
+        s2 (turn/step-turn-client (:new-state s1) r401)
+        req2 (turn/parse-turn-packet (first (:network-out s2)))
+        r-ok (turn/make-allocate-success-response (:tx-id req2) username "turn.bitecho.org" password
+                                                  (InetSocketAddress. "198.51.100.1" 49152)
+                                                  (InetSocketAddress. "203.0.113.1" 5000)
+                                                  600)
+        s3 (turn/step-turn-client (:new-state s2) r-ok)
+        s4 (turn/request-channel-bind (:new-state s3) channel-num peer-addr)
+        req-bind (turn/parse-turn-packet (first (:network-out s4)))
+        r-bind (turn/make-channel-bind-success-response (:tx-id req-bind) username "turn.bitecho.org" password)
+        s5 (turn/step-turn-client (:new-state s4) r-bind)]
+    (:new-state s5)))
+
 (deftest test-end-to-end-holepunch-and-turn-relay-datachannel
   (testing "End-to-end ICE candidate SDP exchange, STUN holepunching, and TURN ChannelData fallback establish DTLS+SCTP DataChannel"
     (doseq [via-turn? [false true]]
@@ -284,6 +308,10 @@
                                               :raddr "10.0.0.2" :rport 5001})
             parsed-a (sdp/parse-candidate cand-a-sdp)
             parsed-b (sdp/parse-candidate cand-b-sdp)
+            tc-a (when via-turn?
+                   (establish-turn-channel-for-peer "alice" "secretA" (InetSocketAddress. "127.0.0.1" 5001) 0x4001))
+            tc-b (when via-turn?
+                   (establish-turn-channel-for-peer "bob" "secretB" (InetSocketAddress. "127.0.0.1" 5000) 0x4001))
             client-a (dc/create-connection {:ice-ufrag "Alice" :ice-pwd "pwdA-123456789012345678"
                                             :remote-ice-ufrag "Bob" :remote-ice-pwd "pwdB-123456789012345678"
                                             :ice-lite? false} true)
@@ -291,10 +319,12 @@
                                             :remote-ice-ufrag "Alice" :remote-ice-pwd "pwdA-123456789012345678"
                                             :ice-lite? false} false)
             client-a (-> client-a
+                         (cond-> tc-a (assoc :turn-client tc-a))
                          (assoc :remote-fingerprint (:fingerprint (:cert-data client-b)))
                          (assoc :remote-candidates [(str (:ip parsed-b) ":" (:port parsed-b))])
                          (assoc-in [:timers :stun/keepalive :expires-at] 0))
             client-b (-> client-b
+                         (cond-> tc-b (assoc :turn-client tc-b))
                          (assoc :remote-fingerprint (:fingerprint (:cert-data client-a)))
                          (assoc :remote-candidates [(str (:ip parsed-a) ":" (:port parsed-a))])
                          (assoc-in [:timers :stun/keepalive :expires-at] 0))
@@ -331,3 +361,163 @@
               msg-ev (first (filter #(= :on-message (:type %)) (:app-events final-b)))]
           (is (some? msg-ev))
           (is (= payload-str (String. ^bytes (:payload msg-ev) "UTF-8"))))))))
+
+(deftest test-unauthenticated-requests-non-nil
+  (testing "Unauthenticated refresh, create-permission, and channel-bind return non-nil ByteBuffer"
+    (let [ref (turn/make-refresh-request nil nil nil nil 600)
+          perm (turn/make-create-permission-request nil nil nil nil (InetSocketAddress. "1.2.3.4" 5000))
+          bind (turn/make-channel-bind-request nil nil nil nil 0x4001 (InetSocketAddress. "1.2.3.4" 5000))]
+      (is (instance? ByteBuffer ref))
+      (is (instance? ByteBuffer perm))
+      (is (instance? ByteBuffer bind))
+      (is (= turn/METHOD_REFRESH_REQUEST (:msg-type (turn/parse-turn-packet ref))))
+      (is (= turn/METHOD_CREATE_PERMISSION_REQUEST (:msg-type (turn/parse-turn-packet perm))))
+      (is (= turn/METHOD_CHANNEL_BIND_REQUEST (:msg-type (turn/parse-turn-packet bind)))))))
+
+(deftest test-turn-client-state-machine-full-lifecycle
+  (testing "Full TURN client state machine: unauth alloc -> 401 challenge -> auto retry -> alloc success -> permission -> channel bind -> send"
+    (let [cli0 (turn/init-turn-client {:username "alice" :password "secret123" :lifetime 600})
+          _ (is (= :idle (:state cli0)))
+          ;; 1. Start allocation (unauthenticated)
+          alloc-step (turn/start-allocation cli0)
+          cli1 (:new-state alloc-step)
+          alloc-pkt (first (:network-out alloc-step))]
+      (is (= :allocating (:state cli1)))
+      (is (instance? ByteBuffer alloc-pkt))
+      (let [parsed-alloc (turn/parse-turn-packet alloc-pkt)]
+        (is (= turn/METHOD_ALLOCATE_REQUEST (:msg-type parsed-alloc)))
+        ;; 2. Server responds with 401 challenge
+        (let [resp-401 (turn/make-allocate-error-response (:tx-id parsed-alloc) "turn.bitecho.org" "nonce-xyz-999")
+              step-401 (turn/step-turn-client cli1 resp-401)
+              cli2 (:new-state step-401)
+              retry-pkt (first (:network-out step-401))
+              retry-evt (first (:events step-401))]
+          (is (= :allocating-authenticated (:state cli2)))
+          (is (= "turn.bitecho.org" (:realm cli2)))
+          (is (= "nonce-xyz-999" (:nonce cli2)))
+          (is (= :turn-challenge-retry (:type retry-evt)))
+          (is (instance? ByteBuffer retry-pkt))
+          ;; 3. Server responds with Allocate Success (with HMAC)
+          (let [parsed-retry (turn/parse-turn-packet retry-pkt)
+                relayed (InetSocketAddress. "198.51.100.10" 49160)
+                mapped (InetSocketAddress. "203.0.113.50" 54321)
+                resp-ok (turn/make-allocate-success-response (:tx-id parsed-retry) "alice" "turn.bitecho.org" "secret123" relayed mapped 600)
+                ;; First test: tampered HMAC is rejected!
+                tampered (let [arr (byte-array (.remaining resp-ok))
+                               _ (.get (.duplicate resp-ok) arr)]
+                           (aset arr 15 (unchecked-byte (bit-xor (int (aget arr 15)) 0xff)))
+                           arr)
+                tampered-res (turn/step-turn-client cli2 tampered)]
+            (is (= :error (:state (:new-state tampered-res))))
+            (is (= :turn-auth-failed (:type (first (:events tampered-res)))))
+
+            ;; Legitimate Allocate Success
+            (let [step-alloc-ok (turn/step-turn-client cli2 resp-ok)
+                  cli3 (:new-state step-alloc-ok)
+                  alloc-evt (first (:events step-alloc-ok))]
+              (is (= :allocated (:state cli3)))
+              (is (= :turn-allocated (:type alloc-evt)))
+              (is (= "198.51.100.10" (get-in cli3 [:relayed-address :ip])))
+
+              ;; 4. Permission creation
+              (let [peer-addr (InetSocketAddress. "192.0.2.77" 9999)
+                    ;; Sending to unpermitted peer fails closed
+                    pre-send (turn/send-via-turn cli3 peer-addr (.getBytes "data" "UTF-8"))
+                    _ (is (false? (:ok? pre-send)))
+                    _ (is (= :no-permission (:error pre-send)))
+                    perm-step (turn/request-permission cli3 peer-addr)
+                    cli4 (:new-state perm-step)
+                    perm-pkt (first (:network-out perm-step))
+                    parsed-perm (turn/parse-turn-packet perm-pkt)
+                    resp-perm (turn/make-create-permission-success-response (:tx-id parsed-perm) "alice" "turn.bitecho.org" "secret123")
+                    step-perm-ok (turn/step-turn-client cli4 resp-perm)
+                    cli5 (:new-state step-perm-ok)]
+                (is (= :turn-permission-created (:type (first (:events step-perm-ok)))))
+                (is (contains? (:permissions cli5) "192.0.2.77"))
+
+                ;; 5. Send via TURN without channel binding uses Send Indication
+                (let [send-res (turn/send-via-turn cli5 peer-addr (.getBytes "hello-peer" "UTF-8"))]
+                  (is (true? (:ok? send-res)))
+                  (let [parsed-ind (turn/parse-turn-packet (first (:network-out send-res)))]
+                    (is (= turn/METHOD_SEND_INDICATION (:msg-type parsed-ind)))))
+
+                ;; 6. Channel binding
+                (let [bind-step (turn/request-channel-bind cli5 0x4002 peer-addr)
+                      cli6 (:new-state bind-step)
+                      bind-pkt (first (:network-out bind-step))
+                      parsed-bind (turn/parse-turn-packet bind-pkt)
+                      resp-bind (turn/make-channel-bind-success-response (:tx-id parsed-bind) "alice" "turn.bitecho.org" "secret123")
+                      step-bind-ok (turn/step-turn-client cli6 resp-bind)
+                      cli7 (:new-state step-bind-ok)]
+                  (is (= :channel-bound (:state cli7)))
+                  (is (= :turn-channel-bound (:type (first (:events step-bind-ok)))))
+                  (is (= peer-addr (get-in cli7 [:channels 0x4002])))
+
+                  ;; 7. Send via TURN with bound channel uses ChannelData
+                  (let [send-ch (turn/send-via-turn cli7 peer-addr (.getBytes "fast-channel-data" "UTF-8"))]
+                    (is (true? (:ok? send-ch)))
+                    (let [ch-frame (first (:network-out send-ch))]
+                      (is (turn/channel-data? ch-frame))
+                      (let [decoded (turn/decode-channel-data ch-frame)]
+                        (is (= 0x4002 (:channel-number decoded)))
+                        (is (= "fast-channel-data" (String. ^bytes (:data decoded) "UTF-8"))))))
+
+                  ;; 8. Receiving ChannelData from peer
+                  (let [incoming-ch (turn/encode-channel-data 0x4002 (.getBytes "inbound-msg" "UTF-8"))
+                        rx-step (turn/step-turn-client cli7 incoming-ch)
+                        rx-evt (first (:events rx-step))]
+                    (is (= :turn-data (:type rx-evt)))
+                    (is (= "inbound-msg" (String. ^bytes (:data rx-evt) "UTF-8"))))
+
+                  ;; 9. Receiving ChannelData for unbound channel drops frame
+                  (let [unbound-ch (turn/encode-channel-data 0x4009 (.getBytes "unbound" "UTF-8"))
+                        drop-step (turn/step-turn-client cli7 unbound-ch)
+                        drop-evt (first (:events drop-step))]
+                    (is (= :turn-drop (:type drop-evt)))
+                    (is (= :unbound-channel (:reason drop-evt)))))))))))))
+
+(deftest test-ice-role-conflict-and-nomination-in-core
+  (testing "resolve-role-conflict logic"
+    ;; Both controlling: higher tie-breaker sends 487 error, lower switches to controlled
+    (let [c1 (stun/resolve-role-conflict :controlling 100 true false 50)
+          c2 (stun/resolve-role-conflict :controlling 50 true false 100)]
+      (is (= 487 (:error-code c1)))
+      (is (= :controlling (:new-role c1)))
+      (is (true? (:switched-role? c2)))
+      (is (= :controlled (:new-role c2))))
+    ;; Both controlled: higher tie-breaker switches to controlling, lower sends 487 error
+    (let [d1 (stun/resolve-role-conflict :controlled 50 false true 100)
+          d2 (stun/resolve-role-conflict :controlled 100 false true 50)]
+      (is (= 487 (:error-code d1)))
+      (is (= :controlled (:new-role d1)))
+      (is (true? (:switched-role? d2)))
+      (is (= :controlling (:new-role d2)))))
+
+  (testing "core/handle-receive STUN nomination, prflx discovery, and role switching"
+    (let [state0 (dc/create-connection {:ice-ufrag "local-u"
+                                        :ice-pwd "local-pwd-123456789012"
+                                        :remote-ice-ufrag "remote-u"
+                                        :remote-ice-pwd "remote-pwd-123456789012"
+                                        :ice-role :controlled
+                                        :ice-tie-breaker 1000} false)
+          ;; Incoming Binding Request with USE-CANDIDATE and remote tie-breaker 2000
+          req-buf (stun/make-binding-request "remote-u" "local-u" "local-pwd-123456789012"
+                                             {:role :controlling
+                                              :tie-breaker 2000
+                                              :use-candidate? true
+                                              :priority 2130706431})
+          peer (InetSocketAddress. "198.51.100.99" 7777)
+          res (dc/handle-receive state0 (bb->bytes req-buf) 1000 peer)]
+      ;; Response generated
+      (is (seq (:network-out res)))
+      ;; Peer-reflexive candidate added to remote-candidates and seen-candidates
+      (is (contains? (:seen-candidates (:new-state res)) "198.51.100.99:7777"))
+      (is (some #{"198.51.100.99:7777"} (:remote-candidates (:new-state res))))
+      ;; Nominated pair is populated on new-state
+      (let [nom (:nominated-pair (:new-state res))]
+        (is (some? nom))
+        (is (= "198.51.100.99:7777" (:candidate nom)))
+        (is (true? (:nominated? nom)))
+        (is (true? (:nominated? (:new-state res)))))
+      ;; Candidate nomination event emitted
+      (is (some #(= :on-ice-candidate-nominated (:type %)) (:app-events res))))))

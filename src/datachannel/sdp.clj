@@ -31,13 +31,21 @@
   "Calculates candidate pair priority per RFC 8445 §6.1.2.3:
    pair-priority = 2^32 * min(G, D) + 2 * max(G, D) + (G > D ? 1 : 0)
    where G is priority of controlling agent candidate, D is priority of controlled agent candidate."
-  [controlling-priority controlled-priority]
-  (let [g (long controlling-priority)
-        d (long controlled-priority)
-        min-val (min g d)
-        max-val (max g d)
-        tie (if (> g d) 1 0)]
-    (+ (* 4294967296 min-val) (* 2 max-val) tie)))
+  ([controlling-priority controlled-priority]
+   (let [g (long controlling-priority)
+         d (long controlled-priority)
+         min-val (min g d)
+         max-val (max g d)
+         tie (if (> g d) 1 0)]
+     (+ (* 4294967296 min-val) (* 2 max-val) tie)))
+  ([local-priority remote-priority controlling?]
+   (if controlling?
+     (calculate-pair-priority local-priority remote-priority)
+     (calculate-pair-priority remote-priority local-priority))))
+
+(def compute-pair-priority
+  "Alias for calculate-pair-priority per RFC 8445 §6.1.2.3."
+  calculate-pair-priority)
 
 (defn generate-ice-credentials
   "Generates a secure ICE ufrag and pwd. The pwd must be at least 22 characters long (RFC 5245)."

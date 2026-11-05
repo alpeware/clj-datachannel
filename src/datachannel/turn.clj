@@ -152,13 +152,19 @@
 (defn channel-data?
   "Returns true if the buffer or byte array starts with a ChannelData header (0x4000..0x7FFF)."
   [buf-or-bytes]
-  (let [buf (if (instance? ByteBuffer buf-or-bytes)
-              (.duplicate ^ByteBuffer buf-or-bytes)
-              (ByteBuffer/wrap ^bytes buf-or-bytes))]
-    (when (>= (.remaining buf) 4)
-      (.order buf ByteOrder/BIG_ENDIAN)
-      (let [ch (bit-and (.getShort buf) 0xffff)]
-        (and (>= ch MIN_CHANNEL_NUMBER) (<= ch MAX_CHANNEL_NUMBER))))))
+  (try
+    (let [buf (if (instance? ByteBuffer buf-or-bytes)
+                (.duplicate ^ByteBuffer buf-or-bytes)
+                (ByteBuffer/wrap ^bytes buf-or-bytes))]
+      (when (>= (.remaining buf) 4)
+        (.order buf ByteOrder/BIG_ENDIAN)
+        (let [ch (bit-and (.getShort buf) 0xffff)
+              len (bit-and (.getShort buf) 0xffff)]
+          (and (>= ch MIN_CHANNEL_NUMBER)
+               (<= ch MAX_CHANNEL_NUMBER)
+               (>= (.remaining buf) len)))))
+    (catch Exception _
+      false)))
 
 (defn encode-channel-data
   "Encodes application payload bytes into an RFC 5766 §11 ChannelData frame
@@ -180,19 +186,24 @@
   "Decodes an RFC 5766 §11 ChannelData frame from a ByteBuffer or byte array,
    returning {:channel-number int :data byte[] :length int}."
   [buf-or-bytes]
-  (let [buf (if (instance? ByteBuffer buf-or-bytes)
-              (.duplicate ^ByteBuffer buf-or-bytes)
-              (ByteBuffer/wrap ^bytes buf-or-bytes))]
-    (.order buf ByteOrder/BIG_ENDIAN)
-    (let [ch (get-u16 buf)
-          len (get-u16 buf)]
-      (when-not (and (>= ch MIN_CHANNEL_NUMBER) (<= ch MAX_CHANNEL_NUMBER))
-        (throw (ex-info "Invalid channel number in ChannelData" {:channel ch})))
-      (let [data (byte-array len)]
-        (.get buf data)
-        {:channel-number ch
-         :data data
-         :length len}))))
+  (try
+    (let [buf (if (instance? ByteBuffer buf-or-bytes)
+                (.duplicate ^ByteBuffer buf-or-bytes)
+                (ByteBuffer/wrap ^bytes buf-or-bytes))]
+      (.order buf ByteOrder/BIG_ENDIAN)
+      (when (>= (.remaining buf) 4)
+        (let [ch (get-u16 buf)
+              len (get-u16 buf)]
+          (when (and (>= ch MIN_CHANNEL_NUMBER)
+                     (<= ch MAX_CHANNEL_NUMBER)
+                     (>= (.remaining buf) len))
+            (let [data (byte-array len)]
+              (.get buf data)
+              {:channel-number ch
+               :data data
+               :length len})))))
+    (catch Exception _
+      nil)))
 
 ;; -----------------------------------------------------------------------------
 ;; TURN Message Serialization
@@ -301,12 +312,14 @@
     (.putInt buf stun/magic-cookie)
     (.put buf tx-id)
     (append-attr-u32 buf ATTR_LIFETIME (long lifetime))
-    (when (and username realm password nonce)
-      (append-attr-string buf stun/ATTR_USERNAME username)
-      (append-attr-string buf ATTR_REALM realm)
-      (append-attr-string buf ATTR_NONCE nonce)
-      (let [key (compute-long-term-key username realm password)]
-        (finalize-turn-message buf key)))))
+    (if (and username realm password nonce)
+      (do
+        (append-attr-string buf stun/ATTR_USERNAME username)
+        (append-attr-string buf ATTR_REALM realm)
+        (append-attr-string buf ATTR_NONCE nonce)
+        (let [key (compute-long-term-key username realm password)]
+          (finalize-turn-message buf key)))
+      (finalize-turn-message buf nil))))
 
 (defn make-create-permission-request
   "Constructs an RFC 5766 CreatePermission Request authorizing relay traffic to/from peer-addr."
@@ -330,12 +343,14 @@
     (put-u16 buf ATTR_XOR_PEER_ADDRESS)
     (put-u16 buf 8)
     (.put buf xor-peer)
-    (when (and username realm password nonce)
-      (append-attr-string buf stun/ATTR_USERNAME username)
-      (append-attr-string buf ATTR_REALM realm)
-      (append-attr-string buf ATTR_NONCE nonce)
-      (let [key (compute-long-term-key username realm password)]
-        (finalize-turn-message buf key)))))
+    (if (and username realm password nonce)
+      (do
+        (append-attr-string buf stun/ATTR_USERNAME username)
+        (append-attr-string buf ATTR_REALM realm)
+        (append-attr-string buf ATTR_NONCE nonce)
+        (let [key (compute-long-term-key username realm password)]
+          (finalize-turn-message buf key)))
+      (finalize-turn-message buf nil))))
 
 (defn make-channel-bind-request
   "Constructs an RFC 5766 ChannelBind Request associating channel-number with peer-addr."
@@ -364,12 +379,14 @@
     (put-u16 buf ATTR_XOR_PEER_ADDRESS)
     (put-u16 buf 8)
     (.put buf xor-peer)
-    (when (and username realm password nonce)
-      (append-attr-string buf stun/ATTR_USERNAME username)
-      (append-attr-string buf ATTR_REALM realm)
-      (append-attr-string buf ATTR_NONCE nonce)
-      (let [key (compute-long-term-key username realm password)]
-        (finalize-turn-message buf key)))))
+    (if (and username realm password nonce)
+      (do
+        (append-attr-string buf stun/ATTR_USERNAME username)
+        (append-attr-string buf ATTR_REALM realm)
+        (append-attr-string buf ATTR_NONCE nonce)
+        (let [key (compute-long-term-key username realm password)]
+          (finalize-turn-message buf key)))
+      (finalize-turn-message buf nil))))
 
 (defn make-send-indication
   "Constructs an RFC 5766 Send Indication datagram carrying application payload to peer-addr."
@@ -517,49 +534,378 @@
 (defn parse-turn-packet
   "Parses an incoming byte buffer into a structured TURN packet map or ChannelData frame."
   [^ByteBuffer buf]
-  (if (channel-data? buf)
-    {:type :channel-data
-     :channel-data (decode-channel-data buf)}
-    (let [start (.position buf)
+  (try
+    (if (channel-data? buf)
+      {:type :channel-data
+       :channel-data (decode-channel-data buf)}
+      (when (>= (.remaining buf) 20)
+        (let [start (.position buf)
+              _ (.order buf ByteOrder/BIG_ENDIAN)
+              msg-type (get-u16 buf)
+              msg-len (get-u16 buf)
+              cookie (.getInt buf)
+              tx-id (byte-array 12)
+              _ (.get buf tx-id)
+              parsed (do (.position buf start) (stun/parse-packet buf))
+              attrs (:attributes parsed)
+              realm-bytes (get attrs ATTR_REALM)
+              realm (when realm-bytes (String. ^bytes realm-bytes "UTF-8"))
+              nonce-bytes (get attrs ATTR_NONCE)
+              nonce (when nonce-bytes (String. ^bytes nonce-bytes "UTF-8"))
+              lifetime-bytes (get attrs ATTR_LIFETIME)
+              lifetime (when (and lifetime-bytes (>= (alength ^bytes lifetime-bytes) 4))
+                         (get-u32 (ByteBuffer/wrap lifetime-bytes)))
+              mapped-bytes (get attrs stun/ATTR_XOR_MAPPED_ADDRESS)
+              mapped (when mapped-bytes (decode-xor-address mapped-bytes cookie))
+              relayed-bytes (get attrs ATTR_XOR_RELAYED_ADDRESS)
+              relayed (when relayed-bytes (decode-xor-address relayed-bytes cookie))
+              peer-bytes (get attrs ATTR_XOR_PEER_ADDRESS)
+              peer (when peer-bytes (decode-xor-address peer-bytes cookie))
+              channel-bytes (get attrs ATTR_CHANNEL_NUMBER)
+              channel (when (and channel-bytes (>= (alength ^bytes channel-bytes) 2))
+                        (get-u16 (ByteBuffer/wrap channel-bytes)))
+              data-bytes (get attrs ATTR_DATA)
+              err-bytes (get attrs stun/ATTR_ERROR_CODE)
+              err-code (when (and err-bytes (>= (alength ^bytes err-bytes) 4))
+                         (let [b (ByteBuffer/wrap err-bytes)
+                               _ (.getShort b)
+                               cls (bit-and (.get b) 0xff)
+                               num (bit-and (.get b) 0xff)]
+                           (+ (* cls 100) num)))]
+          {:msg-type msg-type
+           :msg-len msg-len
+           :tx-id tx-id
+           :realm realm
+           :nonce nonce
+           :lifetime lifetime
+           :relayed-address relayed
+           :mapped-address mapped
+           :peer-address peer
+           :channel-number channel
+           :data data-bytes
+           :error-code err-code
+           :attributes attrs})))
+    (catch Exception _
+      nil)))
+
+;; -----------------------------------------------------------------------------
+;; Pure Sans-IO TURN Client State Machine
+;; -----------------------------------------------------------------------------
+
+(defn- tx-key [tx-id]
+  (when tx-id
+    (if (bytes? tx-id)
+      (let [sb (StringBuilder.)]
+        (doseq [b ^bytes tx-id]
+          (.append sb (format "%02x" (bit-and (int b) 0xff))))
+        (.toString sb))
+      (str tx-id))))
+
+(defn- peer-ip [peer-addr]
+  (cond
+    (instance? InetSocketAddress peer-addr) (.getHostString ^InetSocketAddress peer-addr)
+    (string? peer-addr) (first (str/split (str peer-addr) #":"))
+    :else (str peer-addr)))
+
+(defn- peer-permitted? [permissions peer-addr]
+  (let [ip (peer-ip peer-addr)]
+    (boolean (or (contains? permissions peer-addr)
+                 (contains? permissions ip)
+                 (contains? permissions (str peer-addr))))))
+
+(defn verify-turn-message-integrity
+  "Verifies RFC 5389 §15.4 / RFC 5766 MESSAGE-INTEGRITY attribute on a TURN message buffer.
+   Computes MD5(username:realm:password) long-term key and validates HMAC-SHA1.
+   Returns true if valid, false otherwise."
+  [buf-or-bytes username realm password]
+  (try
+    (let [^ByteBuffer buf (if (instance? ByteBuffer buf-or-bytes)
+                            (.duplicate ^ByteBuffer buf-or-bytes)
+                            (ByteBuffer/wrap ^bytes buf-or-bytes))
           _ (.order buf ByteOrder/BIG_ENDIAN)
-          msg-type (get-u16 buf)
-          msg-len (get-u16 buf)
-          cookie (.getInt buf)
-          tx-id (byte-array 12)
-          _ (.get buf tx-id)
-          parsed (do (.position buf start) (stun/parse-packet buf))
-          attrs (:attributes parsed)
-          realm-bytes (get attrs ATTR_REALM)
-          realm (when realm-bytes (String. ^bytes realm-bytes "UTF-8"))
-          nonce-bytes (get attrs ATTR_NONCE)
-          nonce (when nonce-bytes (String. ^bytes nonce-bytes "UTF-8"))
-          lifetime-bytes (get attrs ATTR_LIFETIME)
-          lifetime (when (and lifetime-bytes (>= (alength ^bytes lifetime-bytes) 4))
-                     (get-u32 (ByteBuffer/wrap lifetime-bytes)))
-          relayed-bytes (get attrs ATTR_XOR_RELAYED_ADDRESS)
-          relayed (when relayed-bytes (decode-xor-address relayed-bytes cookie))
-          peer-bytes (get attrs ATTR_XOR_PEER_ADDRESS)
-          peer (when peer-bytes (decode-xor-address peer-bytes cookie))
-          channel-bytes (get attrs ATTR_CHANNEL_NUMBER)
-          channel (when (and channel-bytes (>= (alength ^bytes channel-bytes) 2))
-                    (get-u16 (ByteBuffer/wrap channel-bytes)))
-          data-bytes (get attrs ATTR_DATA)
-          err-bytes (get attrs stun/ATTR_ERROR_CODE)
-          err-code (when (and err-bytes (>= (alength ^bytes err-bytes) 4))
-                     (let [b (ByteBuffer/wrap err-bytes)
-                           _ (.getShort b)
-                           cls (bit-and (.get b) 0xff)
-                           num (bit-and (.get b) 0xff)]
-                       (+ (* cls 100) num)))]
-      {:msg-type msg-type
-       :msg-len msg-len
-       :tx-id tx-id
-       :realm realm
-       :nonce nonce
-       :lifetime lifetime
-       :relayed-address relayed
-       :peer-address peer
-       :channel-number channel
-       :data data-bytes
-       :error-code err-code
-       :attributes attrs})))
+          start-pos (.position buf)
+          _ (.getShort buf) ;; msg-type
+          msg-len (bit-and (.getShort buf) 0xffff)
+          key (compute-long-term-key username realm password)
+          packet-end (min (.limit buf) (+ start-pos 20 msg-len))]
+      (.position buf (+ start-pos 20))
+      (loop [mi-offset nil
+             received-hmac nil]
+        (if (or mi-offset (>= (.position buf) packet-end))
+          (if (and mi-offset received-hmac)
+            (let [data-to-sign (byte-array (- mi-offset start-pos))]
+              (.position buf start-pos)
+              (.get buf data-to-sign)
+              (let [len-for-hmac (unchecked-short (+ (- mi-offset start-pos 20) 24))]
+                (aset data-to-sign 2 (unchecked-byte (bit-shift-right len-for-hmac 8)))
+                (aset data-to-sign 3 (unchecked-byte (bit-and len-for-hmac 0xff)))
+                (let [calculated-hmac (compute-hmac-sha1 key data-to-sign)]
+                  (java.util.Arrays/equals ^bytes calculated-hmac ^bytes received-hmac))))
+            false)
+          (let [attr-type (get-u16 buf)
+                attr-len (get-u16 buf)
+                padding (mod attr-len 4)
+                pad-len (if (and (> padding 0) (< padding 4)) (- 4 padding) 0)]
+            (if (= attr-type stun/ATTR_MESSAGE_INTEGRITY)
+              (let [offset (- (.position buf) 4)
+                    hmac (byte-array 20)]
+                (.get buf hmac)
+                (recur offset hmac))
+              (do
+                (.position buf (+ (.position buf) attr-len pad-len))
+                (recur nil nil)))))))
+    (catch Exception _
+      false)))
+
+(defn init-turn-client
+  "Initializes pure Sans-IO TURN client state map."
+  [opts]
+  {:state :idle
+   :username (:username opts)
+   :password (:password opts)
+   :realm (:realm opts)
+   :nonce (:nonce opts)
+   :server-addr (:server-addr opts)
+   :lifetime (long (or (:lifetime opts) 600))
+   :relayed-address nil
+   :mapped-address nil
+   :permissions #{}
+   :channels {}
+   :peer->channel {}
+   :pending-tx {}
+   :dropped-frames 0})
+
+(defn start-allocation
+  "Initiates TURN allocation, returning {:new-state ... :network-out [...] :events [...]}."
+  [client-state & [opts]]
+  (let [tx-id (let [t (byte-array 12)] (.nextBytes secure-rand t) t)
+        tx-k (tx-key tx-id)
+        alloc-req (make-allocate-request (:username client-state)
+                                         (:realm client-state)
+                                         (:password client-state)
+                                         (:nonce client-state)
+                                         (assoc opts :tx-id tx-id :lifetime (:lifetime client-state)))
+        new-state (-> client-state
+                      (assoc :state (if (:nonce client-state) :allocating-authenticated :allocating))
+                      (assoc-in [:pending-tx tx-k] {:action :allocate :opts opts}))]
+    {:new-state new-state
+     :network-out [alloc-req]
+     :events []}))
+
+(defn request-permission
+  "Constructs CreatePermission request and records pending permission in client state."
+  [client-state peer-addr & [opts]]
+  (let [tx-id (let [t (byte-array 12)] (.nextBytes secure-rand t) t)
+        tx-k (tx-key tx-id)
+        req (make-create-permission-request (:username client-state)
+                                            (:realm client-state)
+                                            (:password client-state)
+                                            (:nonce client-state)
+                                            peer-addr
+                                            (assoc opts :tx-id tx-id))
+        new-state (assoc-in client-state [:pending-tx tx-k] {:action :create-permission :peer-addr peer-addr})]
+    {:new-state new-state
+     :network-out [req]
+     :events []}))
+
+(defn request-channel-bind
+  "Constructs ChannelBind request and records pending channel bind in client state."
+  [client-state channel-number peer-addr & [opts]]
+  (when-not (and (>= channel-number MIN_CHANNEL_NUMBER) (<= channel-number MAX_CHANNEL_NUMBER))
+    (throw (ex-info "Invalid channel number (must be 0x4000..0x7FFF)" {:channel-number channel-number})))
+  (let [tx-id (let [t (byte-array 12)] (.nextBytes secure-rand t) t)
+        tx-k (tx-key tx-id)
+        req (make-channel-bind-request (:username client-state)
+                                       (:realm client-state)
+                                       (:password client-state)
+                                       (:nonce client-state)
+                                       channel-number
+                                       peer-addr
+                                       (assoc opts :tx-id tx-id))
+        new-state (assoc-in client-state [:pending-tx tx-k] {:action :channel-bind
+                                                             :channel-number channel-number
+                                                             :peer-addr peer-addr})]
+    {:new-state new-state
+     :network-out [req]
+     :events []}))
+
+(defn request-refresh
+  "Constructs Refresh request to extend or terminate allocation."
+  [client-state lifetime & [opts]]
+  (let [tx-id (let [t (byte-array 12)] (.nextBytes secure-rand t) t)
+        tx-k (tx-key tx-id)
+        req (make-refresh-request (:username client-state)
+                                  (:realm client-state)
+                                  (:password client-state)
+                                  (:nonce client-state)
+                                  lifetime
+                                  (assoc opts :tx-id tx-id))
+        new-state (assoc-in client-state [:pending-tx tx-k] {:action :refresh :lifetime lifetime})]
+    {:new-state new-state
+     :network-out [req]
+     :events []}))
+
+(defn send-via-turn
+  "Encapsulates application payload for peer-addr.
+   Fails closed with {:ok? false :error :no-permission} if peer-addr not in permissions.
+   Frames as ChannelData if bound channel exists, else Send Indication."
+  [client-state peer-addr payload-bytes]
+  (let [ip (peer-ip peer-addr)
+        permitted? (peer-permitted? (:permissions client-state) peer-addr)]
+    (if-not (and (#{:allocated :channel-bound} (:state client-state)) permitted?)
+      {:ok? false :error :no-permission}
+      (let [ch (get-in client-state [:peer->channel (str peer-addr)]
+                       (get-in client-state [:peer->channel ip]))
+            frame (if ch
+                    (encode-channel-data ch payload-bytes)
+                    (make-send-indication peer-addr payload-bytes))]
+        {:ok? true :network-out [frame]}))))
+
+(defn step-turn-client
+  "Pure state transition step for TURN client processing inbound network packet."
+  [client-state packet-buf-or-bytes & [_now-ms]]
+  (if (channel-data? packet-buf-or-bytes)
+    (let [{:keys [channel-number data]} (decode-channel-data packet-buf-or-bytes)
+          peer-addr (get-in client-state [:channels channel-number])]
+      (if (and peer-addr (peer-permitted? (:permissions client-state) peer-addr))
+        {:new-state client-state
+         :network-out []
+         :events [{:type :turn-data :peer-address peer-addr :channel-number channel-number :data data}]}
+        {:new-state (update client-state :dropped-frames (fnil inc 0))
+         :network-out []
+         :events [{:type :turn-drop :reason :unbound-channel :channel-number channel-number}]}))
+    (let [^ByteBuffer buf (if (instance? ByteBuffer packet-buf-or-bytes)
+                            (.duplicate ^ByteBuffer packet-buf-or-bytes)
+                            (ByteBuffer/wrap ^bytes packet-buf-or-bytes))
+          parsed (parse-turn-packet buf)]
+      (if (nil? parsed)
+        {:new-state client-state :network-out [] :events []}
+        (let [tx-k (tx-key (:tx-id parsed))
+              pending (get-in client-state [:pending-tx tx-k])
+              new-client-state (update client-state :pending-tx dissoc tx-k)]
+          (cond
+            ;; 401 Unauthorized Challenge on Allocate
+            (and (= (:msg-type parsed) METHOD_ALLOCATE_ERROR)
+                 (= (:error-code parsed) 401)
+                 (:realm parsed)
+                 (:nonce parsed))
+            (let [realm (:realm parsed)
+                  nonce (:nonce parsed)
+                  retry-tx-id (let [t (byte-array 12)] (.nextBytes secure-rand t) t)
+                  retry-tx-k (tx-key retry-tx-id)
+                  auth-alloc (make-allocate-request (:username client-state)
+                                                    realm
+                                                    (:password client-state)
+                                                    nonce
+                                                    {:tx-id retry-tx-id :lifetime (:lifetime client-state)})]
+              {:new-state (-> new-client-state
+                              (assoc :state :allocating-authenticated
+                                     :realm realm
+                                     :nonce nonce)
+                              (assoc-in [:pending-tx retry-tx-k] {:action :allocate-auth}))
+               :network-out [auth-alloc]
+               :events [{:type :turn-challenge-retry :realm realm :nonce nonce}]})
+
+        ;; Allocate Success
+            (= (:msg-type parsed) METHOD_ALLOCATE_RESPONSE)
+            (if (and (:username client-state) (:realm client-state) (:password client-state))
+              (if-not (verify-turn-message-integrity packet-buf-or-bytes (:username client-state) (:realm client-state) (:password client-state))
+                {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
+                 :network-out []
+                 :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
+                (let [st (assoc new-client-state
+                                :state :allocated
+                                :relayed-address (:relayed-address parsed)
+                                :mapped-address (:mapped-address parsed)
+                                :lifetime (or (:lifetime parsed) (:lifetime client-state)))]
+                  {:new-state st
+                   :network-out []
+                   :events [{:type :turn-allocated
+                             :relayed-address (:relayed-address parsed)
+                             :lifetime (:lifetime parsed)}]}))
+          ;; No credentials required
+              (let [st (assoc new-client-state
+                              :state :allocated
+                              :relayed-address (:relayed-address parsed)
+                              :mapped-address (:mapped-address parsed)
+                              :lifetime (or (:lifetime parsed) (:lifetime client-state)))]
+                {:new-state st
+                 :network-out []
+                 :events [{:type :turn-allocated
+                           :relayed-address (:relayed-address parsed)
+                           :lifetime (:lifetime parsed)}]}))
+
+        ;; CreatePermission Success
+            (= (:msg-type parsed) METHOD_CREATE_PERMISSION_RESPONSE)
+            (if (and (:username client-state) (:realm client-state) (:password client-state))
+              (if-not (verify-turn-message-integrity packet-buf-or-bytes (:username client-state) (:realm client-state) (:password client-state))
+                {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
+                 :network-out []
+                 :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
+                (let [peer-addr (:peer-addr pending)
+                      ip (when peer-addr (peer-ip peer-addr))
+                      st (update new-client-state :permissions (fnil conj #{}) (or ip (str peer-addr)))]
+                  {:new-state st
+                   :network-out []
+                   :events [{:type :turn-permission-created :peer-address peer-addr}]}))
+              (let [peer-addr (:peer-addr pending)
+                    ip (when peer-addr (peer-ip peer-addr))
+                    st (update new-client-state :permissions (fnil conj #{}) (or ip (str peer-addr)))]
+                {:new-state st
+                 :network-out []
+                 :events [{:type :turn-permission-created :peer-address peer-addr}]}))
+
+        ;; ChannelBind Success
+            (= (:msg-type parsed) METHOD_CHANNEL_BIND_RESPONSE)
+            (if (and (:username client-state) (:realm client-state) (:password client-state))
+              (if-not (verify-turn-message-integrity packet-buf-or-bytes (:username client-state) (:realm client-state) (:password client-state))
+                {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
+                 :network-out []
+                 :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
+                (let [ch (:channel-number pending)
+                      peer-addr (:peer-addr pending)
+                      ip (when peer-addr (peer-ip peer-addr))
+                      st (-> new-client-state
+                             (assoc :state :channel-bound)
+                             (assoc-in [:channels ch] peer-addr)
+                             (assoc-in [:peer->channel (str peer-addr)] ch)
+                             (cond-> ip (assoc-in [:peer->channel ip] ch))
+                             (update :permissions (fnil conj #{}) (or ip (str peer-addr))))]
+                  {:new-state st
+                   :network-out []
+                   :events [{:type :turn-channel-bound :channel-number ch :peer-address peer-addr}]}))
+              (let [ch (:channel-number pending)
+                    peer-addr (:peer-addr pending)
+                    ip (when peer-addr (peer-ip peer-addr))
+                    st (-> new-client-state
+                           (assoc :state :channel-bound)
+                           (assoc-in [:channels ch] peer-addr)
+                           (assoc-in [:peer->channel (str peer-addr)] ch)
+                           (cond-> ip (assoc-in [:peer->channel ip] ch))
+                           (update :permissions (fnil conj #{}) (or ip (str peer-addr))))]
+                {:new-state st
+                 :network-out []
+                 :events [{:type :turn-channel-bound :channel-number ch :peer-address peer-addr}]}))
+
+        ;; Refresh Success
+            (= (:msg-type parsed) METHOD_REFRESH_RESPONSE)
+            (let [lt (or (:lifetime parsed) 0)
+                  st (assoc new-client-state :lifetime lt :state (if (zero? lt) :closed (:state new-client-state)))]
+              {:new-state st
+               :network-out []
+               :events [{:type (if (zero? lt) :turn-closed :turn-refreshed) :lifetime lt}]})
+
+        ;; Data Indication
+            (= (:msg-type parsed) METHOD_DATA_INDICATION)
+            (let [peer-addr (:peer-address parsed)
+                  permitted? (peer-permitted? (:permissions client-state) peer-addr)]
+              (if permitted?
+                {:new-state new-client-state
+                 :network-out []
+                 :events [{:type :turn-data :peer-address peer-addr :data (:data parsed)}]}
+                {:new-state (update new-client-state :dropped-frames (fnil inc 0))
+                 :network-out []
+                 :events [{:type :turn-drop :reason :unauthorized-peer :peer-address peer-addr}]}))
+
+            :else
+            {:new-state new-client-state :network-out [] :events []}))))))

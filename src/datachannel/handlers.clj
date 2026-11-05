@@ -1,8 +1,10 @@
 (ns datachannel.handlers
-  (:require [datachannel.chunks :as chunks]
+  (:require [clojure.string :as str]
+            [datachannel.chunks :as chunks]
             [datachannel.dtls :as dtls]
             [datachannel.packetize :as packetize]
-            [datachannel.stun :as stun]))
+            [datachannel.stun :as stun])
+  (:import [java.net InetSocketAddress]))
 
 (defmulti handle-timeout-timer
   "Multimethod dispatching timeouts for specific timers like `:sctp/t-delayed-sack`, `:sctp/t1-init`, and `:dtls/flight-timeout`. Returns the resulting core state transitions."
@@ -220,8 +222,14 @@
                         (let [candidates (:remote-candidates state)]
                           (if (seq candidates)
                             (mapv (fn [cand]
-                                    (let [req (stun/make-binding-request (:ice-ufrag state) (:remote-ice-ufrag state) (:remote-ice-pwd state))]
-                                      {:packet req :target cand}))
+                                    (let [target (if (instance? InetSocketAddress cand)
+                                                   cand
+                                                   (if (and (string? cand) (str/includes? cand ":"))
+                                                     (let [[ip port] (str/split cand #":")]
+                                                       (InetSocketAddress. ^String ip (Integer/parseInt port)))
+                                                     cand))
+                                          req (stun/make-binding-request (:ice-ufrag state) (:remote-ice-ufrag state) (:remote-ice-pwd state))]
+                                      {:packet req :target target}))
                                   candidates)
                             (if (:remote-addr state)
                               (let [req (stun/make-binding-request (:ice-ufrag state) (:remote-ice-ufrag state) (:remote-ice-pwd state))]

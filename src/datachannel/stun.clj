@@ -59,8 +59,9 @@
   (bit-and (.get buf) 0xff))
 
 (defn- compute-hmac-sha1 [key data]
-  (let [mac (Mac/getInstance "HmacSHA1")
-        key-spec (SecretKeySpec. (.getBytes key "UTF-8") "HmacSHA1")]
+  (let [key-bytes (if (string? key) (.getBytes ^String key "UTF-8") ^bytes key)
+        mac (Mac/getInstance "HmacSHA1")
+        key-spec (SecretKeySpec. key-bytes "HmacSHA1")]
     (.init mac key-spec)
     (.doFinal mac data)))
 
@@ -319,6 +320,76 @@
     (.flip resp-buf)
     resp-buf))
 
+(defn resolve-role-conflict
+  "Resolves RFC 8445 §7.2.1.1 ICE role conflicts using tie-breaker comparisons.
+   Returns {:conflict? bool :switched-role? bool :error-code int :new-role kw}."
+  [local-role local-tie-breaker remote-controlling? remote-controlled? remote-tie-breaker]
+  (cond
+    (and (= local-role :controlling) remote-controlling?)
+    (if (>= (Long/compareUnsigned (long (or local-tie-breaker 0)) (long (or remote-tie-breaker 0))) 0)
+      {:conflict? true :error-code 487 :new-role :controlling}
+      {:conflict? true :switched-role? true :new-role :controlled})
+
+    (and (= local-role :controlled) remote-controlled?)
+    (if (< (Long/compareUnsigned (long (or local-tie-breaker 0)) (long (or remote-tie-breaker 0))) 0)
+      {:conflict? true :error-code 487 :new-role :controlled}
+      {:conflict? true :switched-role? true :new-role :controlling})
+
+    :else
+    {:conflict? false :new-role local-role}))
+
+(defn make-error-response
+  "Constructs an RFC 5389 STUN Binding Error Response with ERROR-CODE, MESSAGE-INTEGRITY, and FINGERPRINT."
+  [password tx-id error-code reason-phrase]
+  (let [resp-buf (ByteBuffer/allocate 1024)
+        _ (.order resp-buf ByteOrder/BIG_ENDIAN)
+        reason-bytes (.getBytes ^String (or reason-phrase "Role Conflict") "UTF-8")
+        r-len (alength reason-bytes)
+        attr-len (+ 4 r-len)
+        padding (let [r (mod r-len 4)] (if (zero? r) 0 (- 4 r)))]
+    (put-unsigned-short resp-buf 0x0111) ;; Binding Error Response
+    (put-unsigned-short resp-buf 0)
+    (.putInt resp-buf magic-cookie)
+    (.put resp-buf tx-id)
+    ;; ERROR-CODE
+    (put-unsigned-short resp-buf ATTR_ERROR_CODE)
+    (put-unsigned-short resp-buf attr-len)
+    (.put resp-buf (byte 0))
+    (.put resp-buf (byte 0))
+    (.put resp-buf (byte (int (/ error-code 100))))
+    (.put resp-buf (byte (int (mod error-code 100))))
+    (.put resp-buf reason-bytes)
+    (dotimes [_ padding] (.put resp-buf (byte 0)))
+    ;; MESSAGE-INTEGRITY
+    (when (some? password)
+      (let [len-before-mi (- (.position resp-buf) 20)
+            total-len (+ len-before-mi 24)]
+        (.putShort resp-buf 2 (unchecked-short total-len)))
+      (let [len-to-sign (.position resp-buf)
+            data-to-sign (byte-array len-to-sign)]
+        (.position resp-buf 0)
+        (.get resp-buf data-to-sign)
+        (.position resp-buf len-to-sign)
+        (let [hmac (compute-hmac-sha1 password data-to-sign)]
+          (put-unsigned-short resp-buf ATTR_MESSAGE_INTEGRITY)
+          (put-unsigned-short resp-buf 20)
+          (.put resp-buf hmac))))
+    ;; FINGERPRINT
+    (let [len-before-fp (- (.position resp-buf) 20)
+          total-len (+ len-before-fp 8)]
+      (.putShort resp-buf 2 (unchecked-short total-len)))
+    (let [len-to-crc (.position resp-buf)
+          data-to-crc (byte-array len-to-crc)]
+      (.position resp-buf 0)
+      (.get resp-buf data-to-crc)
+      (.position resp-buf len-to-crc)
+      (let [crc (compute-crc32 data-to-crc)]
+        (put-unsigned-short resp-buf ATTR_FINGERPRINT)
+        (put-unsigned-short resp-buf 4)
+        (.putInt resp-buf (unchecked-int crc))))
+    (.flip resp-buf)
+    resp-buf))
+
 (defn handle-packet
   "Decodes an incoming UDP datagram as STUN bytes. Dispatches ICE Binding Requests to yield a generated `response` if authenticated, and Binding Responses to map newly discovered `candidate` addresses."
   [^ByteBuffer buf ^InetSocketAddress peer-addr connection]
@@ -335,35 +406,46 @@
                 (= msg-type 0x0001)
                 (if-let [password (:ice-pwd connection)]
                   (if (check-message-integrity buf start-pos msg-len password)
-                    (if-let [resp (make-binding-response password tx-id peer-addr)]
-                      (do
-                        (.position buf start-pos)
-                        (let [parsed (parse-packet buf)
-                              attrs (:attributes parsed)
-                              u-bytes (get attrs ATTR_USERNAME)
-                              username-str (when u-bytes (String. ^bytes u-bytes "UTF-8"))
-                              [target-ufrag caller-ufrag] (when (and username-str (str/includes? username-str ":"))
-                                                            (str/split username-str #":" 2))
-                              conn-ufrag (:ice-ufrag connection)
-                              controlling-bytes (get attrs ATTR_ICE_CONTROLLING)
-                              controlling-tb (when (and controlling-bytes (>= (alength ^bytes controlling-bytes) 8))
-                                               (.getLong (ByteBuffer/wrap controlling-bytes)))
-                              controlled-bytes (get attrs ATTR_ICE_CONTROLLED)
-                              controlled-tb (when (and controlled-bytes (>= (alength ^bytes controlled-bytes) 8))
-                                              (.getLong (ByteBuffer/wrap controlled-bytes)))
-                              use-candidate? (contains? attrs ATTR_USE_CANDIDATE)
-                              priority-bytes (get attrs ATTR_PRIORITY)
-                              priority (when (and priority-bytes (>= (alength ^bytes priority-bytes) 4))
-                                         (bit-and (.getInt (ByteBuffer/wrap priority-bytes)) 0xffffffff))
-                              prflx-cand (when peer-addr
-                                           (str (.getHostAddress (.getAddress peer-addr)) ":" (.getPort peer-addr)))]
-                          (if (and (string? conn-ufrag)
-                                   (not (str/blank? conn-ufrag))
-                                   (string? target-ufrag)
-                                   (not (str/blank? target-ufrag))
-                                   (not= target-ufrag conn-ufrag))
-                            {}
-                            (cond-> {:response resp}
+                    (do
+                      (.position buf start-pos)
+                      (let [parsed (parse-packet buf)
+                            attrs (:attributes parsed)
+                            u-bytes (get attrs ATTR_USERNAME)
+                            username-str (when u-bytes (String. ^bytes u-bytes "UTF-8"))
+                            [target-ufrag caller-ufrag] (when (and username-str (str/includes? username-str ":"))
+                                                          (str/split username-str #":" 2))
+                            conn-ufrag (:ice-ufrag connection)
+                            controlling-bytes (get attrs ATTR_ICE_CONTROLLING)
+                            controlling-tb (when (and controlling-bytes (>= (alength ^bytes controlling-bytes) 8))
+                                             (.getLong (ByteBuffer/wrap controlling-bytes)))
+                            controlled-bytes (get attrs ATTR_ICE_CONTROLLED)
+                            controlled-tb (when (and controlled-bytes (>= (alength ^bytes controlled-bytes) 8))
+                                            (.getLong (ByteBuffer/wrap controlled-bytes)))
+                            use-candidate? (contains? attrs ATTR_USE_CANDIDATE)
+                            priority-bytes (get attrs ATTR_PRIORITY)
+                            priority (when (and priority-bytes (>= (alength ^bytes priority-bytes) 4))
+                                       (bit-and (.getInt (ByteBuffer/wrap priority-bytes)) 0xffffffff))
+                            prflx-cand (when peer-addr
+                                         (str (.getHostAddress (.getAddress peer-addr)) ":" (.getPort peer-addr)))
+                            local-role (:ice-role connection)
+                            local-tb (:ice-tie-breaker connection)
+                            remote-controlling? (some? controlling-tb)
+                            remote-controlled? (some? controlled-tb)
+                            remote-tb (or controlling-tb controlled-tb)
+                            rc (if (and local-role (or remote-controlling? remote-controlled?))
+                                 (resolve-role-conflict local-role local-tb remote-controlling? remote-controlled? remote-tb)
+                                 {:conflict? false :new-role local-role})]
+                        (if (and (string? conn-ufrag)
+                                 (not (str/blank? conn-ufrag))
+                                 (string? target-ufrag)
+                                 (not (str/blank? target-ufrag))
+                                 (not= target-ufrag conn-ufrag))
+                          {}
+                          (if (and (:conflict? rc) (= (:error-code rc) 487))
+                            (cond-> {:response (make-error-response password tx-id 487 "Role Conflict")
+                                     :role-conflict? true
+                                     :error-code 487
+                                     :new-role (:new-role rc)}
                               (and caller-ufrag (not (str/blank? caller-ufrag)))
                               (assoc :remote-ice-ufrag caller-ufrag :username username-str)
                               controlling-tb (assoc :ice-controlling true :tie-breaker controlling-tb)
@@ -371,8 +453,20 @@
                               use-candidate? (assoc :use-candidate? true)
                               priority (assoc :priority priority)
                               prflx-cand (assoc :prflx-address prflx-cand
-                                                :peer-reflexive-candidate prflx-cand)))))
-                      {})
+                                                :peer-reflexive-candidate prflx-cand))
+                            (if-let [resp (make-binding-response password tx-id peer-addr)]
+                              (cond-> {:response resp}
+                                (and caller-ufrag (not (str/blank? caller-ufrag)))
+                                (assoc :remote-ice-ufrag caller-ufrag :username username-str)
+                                controlling-tb (assoc :ice-controlling true :tie-breaker controlling-tb)
+                                controlled-tb (assoc :ice-controlled true :tie-breaker controlled-tb)
+                                use-candidate? (assoc :use-candidate? true)
+                                priority (assoc :priority priority)
+                                prflx-cand (assoc :prflx-address prflx-cand
+                                                  :peer-reflexive-candidate prflx-cand)
+                                (:switched-role? rc) (assoc :switched-role? true :new-role (:new-role rc))
+                                (and (:new-role rc) (not (:switched-role? rc))) (assoc :new-role (:new-role rc)))
+                              {})))))
                     {})
                   {})
 

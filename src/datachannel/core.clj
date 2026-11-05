@@ -6,7 +6,9 @@
             [datachannel.packetize :as packetize]
             [datachannel.reassemble :as reassemble]
             [datachannel.sctp :as sctp]
-            [datachannel.stun :as stun])
+            [datachannel.sdp :as sdp]
+            [datachannel.stun :as stun]
+            [datachannel.turn :as turn])
   (:import [java.nio ByteBuffer]
            [javax.net.ssl SSLEngineResult$HandshakeStatus]
            [java.security SecureRandom]))
@@ -126,41 +128,112 @@
     (let [first-byte (bit-and (aget network-bytes 0) 0xFF)
           engine (:dtls/engine state)]
       (cond
-        ;; STUN
+        ;; ChannelData (first byte 64..127)
+        (and (>= first-byte 64) (<= first-byte 127))
+        (try
+          (if-let [tc (:turn-client state)]
+            (let [turn-res (turn/step-turn-client tc network-bytes now-ms)
+                  tc-new (:new-state turn-res)
+                  state-with-tc (assoc state :turn-client tc-new)
+                  events (:events turn-res)
+                  data-evts (filter #(= (:type %) :turn-data) events)]
+              (if (seq data-evts)
+                (reduce (fn [acc evt]
+                          (let [inner-res (handle-receive (:new-state acc) (:data evt) now-ms (:peer-address evt))]
+                            {:new-state (:new-state inner-res)
+                             :network-out (into (:network-out acc) (:network-out inner-res))
+                             :app-events (into (:app-events acc) (:app-events inner-res))}))
+                        {:new-state state-with-tc :network-out (vec (:network-out turn-res)) :app-events (vec events)}
+                        data-evts)
+                {:new-state state-with-tc :network-out (vec (:network-out turn-res)) :app-events (vec events)}))
+            (if (turn/channel-data? network-bytes)
+              (if-let [cd (turn/decode-channel-data network-bytes)]
+                (handle-receive state (:data cd) now-ms remote-addr)
+                {:new-state state :network-out [] :app-events []})
+              {:new-state state :network-out [] :app-events []}))
+          (catch Exception _
+            {:new-state state :network-out [] :app-events []}))
+
+        ;; STUN or TURN
         (and (>= first-byte 0) (<= first-byte 3))
-        (let [buf (ByteBuffer/wrap network-bytes)
-              stun-res (stun/handle-packet buf remote-addr state)
-              response (:response stun-res)
-              candidate (:candidate stun-res)
-              binding-response? (boolean (:binding-response? stun-res))
-              valid-stun? (or (some? response) (some? candidate) binding-response?)
-              new-candidate? (and candidate (not (contains? (:seen-candidates state) candidate)))
-              became-connected? (and (not= (:ice-connection-state state) :connected)
-                                     (or response candidate binding-response?))
-              remote-ufrag (:remote-ice-ufrag stun-res)
-              eff-ufrag (or remote-ufrag (:remote-ice-ufrag state))
-              peer-pwds-raw (:peer-ice-pwds state)
-              peer-pwds (if (instance? clojure.lang.IDeref peer-pwds-raw) @peer-pwds-raw peer-pwds-raw)
-              resolved-pwd (when (and eff-ufrag (map? peer-pwds)) (get peer-pwds eff-ufrag))
-              new-state (-> state
-                            (cond-> valid-stun? (assoc :last-stun-received now-ms
-                                                       :last-any-traffic now-ms))
-                            (cond-> response (assoc :remote-addr remote-addr))
-                            (cond-> (and remote-ufrag (nil? (:remote-ice-ufrag state)))
-                              (assoc :remote-ice-ufrag remote-ufrag))
-                            (cond-> (and resolved-pwd (nil? (:remote-ice-pwd state)))
-                              (assoc :remote-ice-pwd resolved-pwd))
-                            (cond-> new-candidate? (update :seen-candidates (fnil conj #{}) candidate))
-                            (cond-> (and new-candidate? binding-response?)
-                              (update :local-candidates (fnil conj []) candidate))
-                            (cond-> (and new-candidate? (not binding-response?))
-                              (update :remote-candidates (fnil conj []) candidate))
-                            (cond-> became-connected? (assoc :ice-connection-state :connected)))
-              app-events (cond-> [{:type :stun-packet :payload network-bytes}]
-                           new-candidate? (conj {:type :on-ice-candidate :candidate candidate})
-                           became-connected? (conj {:type :on-ice-connection-state-change :state :connected}))
-              network-out (if response [response] [])]
-          {:new-state new-state :network-out network-out :app-events app-events})
+        (let [msg-type (if (>= (alength network-bytes) 2)
+                         (bit-and (short (+ (bit-shift-left (bit-and (aget network-bytes 0) 0xFF) 8)
+                                            (bit-and (aget network-bytes 1) 0xFF)))
+                                  0xFFFF)
+                         0)]
+          (if (#{:turn 0x0003 0x0103 0x0113 0x0004 0x0104 0x0114 0x0008 0x0108 0x0118 0x0009 0x0109 0x0119 0x0016 0x0017} msg-type)
+            (try
+              (let [tc (or (:turn-client state) (turn/init-turn-client {}))
+                    turn-res (turn/step-turn-client tc network-bytes now-ms)
+                    state-with-tc (assoc state :turn-client (:new-state turn-res))
+                    events (:events turn-res)
+                    data-evts (filter #(= (:type %) :turn-data) events)]
+                (if (seq data-evts)
+                  (reduce (fn [acc evt]
+                            (let [inner-res (handle-receive (:new-state acc) (:data evt) now-ms (:peer-address evt))]
+                              {:new-state (:new-state inner-res)
+                               :network-out (into (:network-out acc) (:network-out inner-res))
+                               :app-events (into (:app-events acc) (:app-events inner-res))}))
+                          {:new-state state-with-tc :network-out (vec (:network-out turn-res)) :app-events (vec events)}
+                          data-evts)
+                  {:new-state state-with-tc :network-out (vec (:network-out turn-res)) :app-events (vec events)}))
+              (catch Exception _
+                {:new-state state :network-out [] :app-events []}))
+            (let [buf (ByteBuffer/wrap network-bytes)
+                  stun-res (stun/handle-packet buf remote-addr state)
+                  response (:response stun-res)
+                  candidate (:candidate stun-res)
+                  prflx-cand (:peer-reflexive-candidate stun-res)
+                  eff-cand (or candidate prflx-cand)
+                  binding-response? (boolean (:binding-response? stun-res))
+                  valid-stun? (or (some? response) (some? candidate) (some? prflx-cand) binding-response?)
+                  new-candidate? (and eff-cand (not (contains? (:seen-candidates state) eff-cand)))
+                  became-connected? (and (not= (:ice-connection-state state) :connected)
+                                         (or response candidate binding-response?))
+                  remote-ufrag (:remote-ice-ufrag stun-res)
+                  eff-ufrag (or remote-ufrag (:remote-ice-ufrag state))
+                  peer-pwds-raw (:peer-ice-pwds state)
+                  peer-pwds (if (instance? clojure.lang.IDeref peer-pwds-raw) @peer-pwds-raw peer-pwds-raw)
+                  resolved-pwd (when (and eff-ufrag (map? peer-pwds)) (get peer-pwds eff-ufrag))
+                  new-role (:new-role stun-res)
+                  curr-role (or new-role (:ice-role state))
+                  local-prio (or (:local-priority state) stun/DEFAULT_PRIORITY)
+                  remote-prio (or (:priority stun-res) stun/DEFAULT_PRIORITY)
+                  use-candidate? (:use-candidate? stun-res)
+                  should-nominate? (or use-candidate? (and binding-response? (= curr-role :controlling)))
+                  pair-prio (when should-nominate?
+                              (sdp/compute-pair-priority local-prio remote-prio (= curr-role :controlling)))
+                  existing-nom (:nominated-pair state)
+                  nominate-now? (and pair-prio
+                                     (or (nil? existing-nom)
+                                         (> pair-prio (or (:pair-priority existing-nom) 0))))
+                  nom-pair (when nominate-now?
+                             {:remote-addr remote-addr
+                              :candidate (or eff-cand (str remote-addr))
+                              :pair-priority pair-prio
+                              :nominated? true})
+                  new-state (-> state
+                                (cond-> valid-stun? (assoc :last-stun-received now-ms
+                                                           :last-any-traffic now-ms))
+                                (cond-> response (assoc :remote-addr remote-addr))
+                                (cond-> new-role (assoc :ice-role new-role))
+                                (cond-> (and remote-ufrag (nil? (:remote-ice-ufrag state)))
+                                  (assoc :remote-ice-ufrag remote-ufrag))
+                                (cond-> (and resolved-pwd (nil? (:remote-ice-pwd state)))
+                                  (assoc :remote-ice-pwd resolved-pwd))
+                                (cond-> new-candidate? (update :seen-candidates (fnil conj #{}) eff-cand))
+                                (cond-> (and new-candidate? binding-response?)
+                                  (update :local-candidates (fnil conj []) eff-cand))
+                                (cond-> (and new-candidate? (not binding-response?))
+                                  (update :remote-candidates (fnil conj []) eff-cand))
+                                (cond-> nom-pair (assoc :nominated-pair nom-pair :nominated? true))
+                                (cond-> became-connected? (assoc :ice-connection-state :connected)))
+                  app-events (cond-> [{:type :stun-packet :payload network-bytes}]
+                               new-candidate? (conj {:type :on-ice-candidate :candidate eff-cand})
+                               nom-pair (conj {:type :on-ice-candidate-nominated :nominated-pair nom-pair})
+                               became-connected? (conj {:type :on-ice-connection-state-change :state :connected}))
+                  network-out (if response [response] [])]
+              {:new-state new-state :network-out network-out :app-events app-events})))
 
         ;; DTLS
         (and (>= first-byte 20) (<= first-byte 63))
@@ -298,6 +371,12 @@
      :peer-ice-pwds (:peer-ice-pwds options)
      :remote-fingerprint (:remote-fingerprint options)
      :ice-lite? (boolean (:ice-lite? options))
+     :ice-role (or (:ice-role options) (if client-mode? :controlling :controlled))
+     :ice-tie-breaker (or (:ice-tie-breaker options) (.nextLong secure-rand))
+     :nominated-pair nil
+     :nominated? false
+     :local-priority (or (:local-priority options) stun/DEFAULT_PRIORITY)
+     :turn-client (when-let [tc (:turn-config options)] (turn/init-turn-client tc))
      :ice-gathering-state :new
      :ice-connection-state :new
      :seen-candidates #{}
