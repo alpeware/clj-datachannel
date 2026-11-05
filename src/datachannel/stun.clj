@@ -70,78 +70,95 @@
     (bit-xor (.getValue crc) 0x5354554e)))
 
 (defn make-binding-request
-  "Constructs an RFC 5389 STUN Binding Request packet containing USERNAME, PRIORITY, ICE-CONTROLLED, MESSAGE-INTEGRITY (signed using HMAC-SHA1 and `remote-pwd`), and a CRC32c FINGERPRINT."
-  [local-ufrag remote-ufrag remote-pwd]
-  (let [buf (ByteBuffer/allocate 1024)
-        _ (.order buf ByteOrder/BIG_ENDIAN)
-        tx-id (byte-array 12)]
-    (.nextBytes secure-rand tx-id)
+  "Constructs an RFC 5389 STUN Binding Request packet containing USERNAME, PRIORITY,
+   ICE-CONTROLLED or ICE-CONTROLLING, optional USE-CANDIDATE,
+   MESSAGE-INTEGRITY (signed using HMAC-SHA1 and `remote-pwd`), and a CRC32c FINGERPRINT."
+  ([local-ufrag remote-ufrag remote-pwd]
+   (make-binding-request local-ufrag remote-ufrag remote-pwd nil))
+  ([local-ufrag remote-ufrag remote-pwd opts]
+   (let [buf (ByteBuffer/allocate 1024)
+         _ (.order buf ByteOrder/BIG_ENDIAN)
+         tx-id (byte-array 12)]
+     (.nextBytes secure-rand tx-id)
 
-    ;; Header
-    (put-unsigned-short buf 0x0001) ;; Binding Request
-    (put-unsigned-short buf 0) ;; Length placeholder
-    (.putInt buf magic-cookie)
-    (.put buf tx-id)
+     ;; Header
+     (put-unsigned-short buf 0x0001) ;; Binding Request
+     (put-unsigned-short buf 0) ;; Length placeholder
+     (.putInt buf magic-cookie)
+     (.put buf tx-id)
 
-    ;; Attributes
+     ;; Attributes
 
-    ;; USERNAME
-    (let [username (str remote-ufrag ":" local-ufrag)
-          u-bytes (.getBytes username "UTF-8")
-          len (alength u-bytes)
-          padding (let [r (mod len 4)] (if (zero? r) 0 (- 4 r)))]
-      (put-unsigned-short buf ATTR_USERNAME)
-      (put-unsigned-short buf len)
-      (.put buf u-bytes)
-      (dotimes [_ padding] (.put buf (byte 0))))
+     ;; USERNAME
+     (let [username (str remote-ufrag ":" local-ufrag)
+           u-bytes (.getBytes username "UTF-8")
+           len (alength u-bytes)
+           padding (let [r (mod len 4)] (if (zero? r) 0 (- 4 r)))]
+       (put-unsigned-short buf ATTR_USERNAME)
+       (put-unsigned-short buf len)
+       (.put buf u-bytes)
+       (dotimes [_ padding] (.put buf (byte 0))))
 
-    ;; PRIORITY (optional, but good practice)
-    (put-unsigned-short buf ATTR_PRIORITY)
-    (put-unsigned-short buf 4)
-    (.putInt buf DEFAULT_PRIORITY)
+     ;; PRIORITY
+     (let [p (long (or (:priority opts) DEFAULT_PRIORITY))]
+       (put-unsigned-short buf ATTR_PRIORITY)
+       (put-unsigned-short buf 4)
+       (.putInt buf (unchecked-int p)))
 
-    ;; ICE-CONTROLLING (or CONTROLLED)
-    ;; Since we are passive/lite, we usually are controlled.
-    (put-unsigned-short buf ATTR_ICE_CONTROLLED)
-    (put-unsigned-short buf 8)
-    (.putLong buf (.nextLong secure-rand))
+     ;; ICE-CONTROLLING or ICE-CONTROLLED
+     (let [role (or (:role opts) :controlled)
+           tb (long (or (:tie-breaker opts) (.nextLong secure-rand)))]
+       (if (= role :controlling)
+         (do
+           (put-unsigned-short buf ATTR_ICE_CONTROLLING)
+           (put-unsigned-short buf 8)
+           (.putLong buf tb))
+         (do
+           (put-unsigned-short buf ATTR_ICE_CONTROLLED)
+           (put-unsigned-short buf 8)
+           (.putLong buf tb))))
 
-    ;; Update Header Length for MI (FINGERPRINT comes after, but length in header for MI should only include MI)
-    (let [len-before-mi (- (.position buf) 20)
-          len-with-mi (+ len-before-mi 24)]
-      (.putShort buf 2 (unchecked-short len-with-mi)))
+     ;; USE-CANDIDATE
+     (when (:use-candidate? opts)
+       (put-unsigned-short buf ATTR_USE_CANDIDATE)
+       (put-unsigned-short buf 0))
 
-    ;; MESSAGE-INTEGRITY
-    (let [len-to-sign (.position buf)
-          data-to-sign (byte-array len-to-sign)]
-      (.position buf 0)
-      (.get buf data-to-sign)
-      (.position buf len-to-sign)
+     ;; Update Header Length for MI (FINGERPRINT comes after, but length in header for MI should only include MI)
+     (let [len-before-mi (- (.position buf) 20)
+           len-with-mi (+ len-before-mi 24)]
+       (.putShort buf 2 (unchecked-short len-with-mi)))
 
-      (let [hmac (compute-hmac-sha1 remote-pwd data-to-sign)]
-        (put-unsigned-short buf ATTR_MESSAGE_INTEGRITY)
-        (put-unsigned-short buf 20)
-        (.put buf hmac)))
+     ;; MESSAGE-INTEGRITY
+     (let [len-to-sign (.position buf)
+           data-to-sign (byte-array len-to-sign)]
+       (.position buf 0)
+       (.get buf data-to-sign)
+       (.position buf len-to-sign)
 
-    ;; FINGERPRINT
-    ;; Update Header Length to include FINGERPRINT
-    (let [len-before-fp (- (.position buf) 20)
-          total-len (+ len-before-fp 8)]
-      (.putShort buf 2 (unchecked-short total-len)))
+       (let [hmac (compute-hmac-sha1 remote-pwd data-to-sign)]
+         (put-unsigned-short buf ATTR_MESSAGE_INTEGRITY)
+         (put-unsigned-short buf 20)
+         (.put buf hmac)))
 
-    (let [len-to-crc (.position buf)
-          data-to-crc (byte-array len-to-crc)]
-      (.position buf 0)
-      (.get buf data-to-crc)
-      (.position buf len-to-crc)
+     ;; FINGERPRINT
+     ;; Update Header Length to include FINGERPRINT
+     (let [len-before-fp (- (.position buf) 20)
+           total-len (+ len-before-fp 8)]
+       (.putShort buf 2 (unchecked-short total-len)))
 
-      (let [crc (compute-crc32 data-to-crc)]
-        (put-unsigned-short buf ATTR_FINGERPRINT)
-        (put-unsigned-short buf 4)
-        (.putInt buf (unchecked-int crc))))
+     (let [len-to-crc (.position buf)
+           data-to-crc (byte-array len-to-crc)]
+       (.position buf 0)
+       (.get buf data-to-crc)
+       (.position buf len-to-crc)
 
-    (.flip buf)
-    buf))
+       (let [crc (compute-crc32 data-to-crc)]
+         (put-unsigned-short buf ATTR_FINGERPRINT)
+         (put-unsigned-short buf 4)
+         (.putInt buf (unchecked-int crc))))
+
+     (.flip buf)
+     buf)))
 
 (defn make-simple-binding-request
   "Constructs a minimal, unauthenticated STUN Binding Request lacking extensions or integrity checks."
@@ -322,11 +339,24 @@
                       (do
                         (.position buf start-pos)
                         (let [parsed (parse-packet buf)
-                              u-bytes (get (:attributes parsed) ATTR_USERNAME)
+                              attrs (:attributes parsed)
+                              u-bytes (get attrs ATTR_USERNAME)
                               username-str (when u-bytes (String. ^bytes u-bytes "UTF-8"))
                               [target-ufrag caller-ufrag] (when (and username-str (str/includes? username-str ":"))
                                                             (str/split username-str #":" 2))
-                              conn-ufrag (:ice-ufrag connection)]
+                              conn-ufrag (:ice-ufrag connection)
+                              controlling-bytes (get attrs ATTR_ICE_CONTROLLING)
+                              controlling-tb (when (and controlling-bytes (>= (alength ^bytes controlling-bytes) 8))
+                                               (.getLong (ByteBuffer/wrap controlling-bytes)))
+                              controlled-bytes (get attrs ATTR_ICE_CONTROLLED)
+                              controlled-tb (when (and controlled-bytes (>= (alength ^bytes controlled-bytes) 8))
+                                              (.getLong (ByteBuffer/wrap controlled-bytes)))
+                              use-candidate? (contains? attrs ATTR_USE_CANDIDATE)
+                              priority-bytes (get attrs ATTR_PRIORITY)
+                              priority (when (and priority-bytes (>= (alength ^bytes priority-bytes) 4))
+                                         (bit-and (.getInt (ByteBuffer/wrap priority-bytes)) 0xffffffff))
+                              prflx-cand (when peer-addr
+                                           (str (.getHostAddress (.getAddress peer-addr)) ":" (.getPort peer-addr)))]
                           (if (and (string? conn-ufrag)
                                    (not (str/blank? conn-ufrag))
                                    (string? target-ufrag)
@@ -335,7 +365,13 @@
                             {}
                             (cond-> {:response resp}
                               (and caller-ufrag (not (str/blank? caller-ufrag)))
-                              (assoc :remote-ice-ufrag caller-ufrag :username username-str)))))
+                              (assoc :remote-ice-ufrag caller-ufrag :username username-str)
+                              controlling-tb (assoc :ice-controlling true :tie-breaker controlling-tb)
+                              controlled-tb (assoc :ice-controlled true :tie-breaker controlled-tb)
+                              use-candidate? (assoc :use-candidate? true)
+                              priority (assoc :priority priority)
+                              prflx-cand (assoc :prflx-address prflx-cand
+                                                :peer-reflexive-candidate prflx-cand)))))
                       {})
                     {})
                   {})

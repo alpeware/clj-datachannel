@@ -5,6 +5,7 @@
             [datachannel.enforce-dtls-test]
             [datachannel.fuzz-test]
             [datachannel.handshake-test]
+            [datachannel.ice-turn-holepunch-test]
             [datachannel.listen-integration-test]
             [datachannel.pure-p2p-integration-test]
             [datachannel.pure-p2p-mitm-integration-test]
@@ -88,6 +89,7 @@
     'datachannel.rehandshake-test
     'datachannel.reaper-keepalive-test
     'datachannel.stun-test
+    'datachannel.ice-turn-holepunch-test
     'datachannel.sctp-state-machine-test
     'datachannel.sctp-establish-simultaneous-connection-test
     'datachannel.sctp-error-chunk-test
