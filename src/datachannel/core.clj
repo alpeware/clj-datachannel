@@ -290,9 +290,12 @@
                   relay-active? (and (or (:use-turn-relay? state) (:last-rx-via-turn? state))
                                      (:turn-client state)
                                      (#{:allocated :channel-bound} (get-in state [:turn-client :state])))
-                  local-prio (or (:local-priority state)
-                                 (sdp/compute-candidate-priority (if relay-active? :relay :host) 65535 1))
-                  remote-prio (or (:priority stun-res) (sdp/compute-candidate-priority :host 65535 1))
+                  local-prio (if relay-active?
+                               (sdp/compute-candidate-priority :relay 65535 1)
+                               (or (:local-priority state)
+                                   (sdp/compute-candidate-priority :host 65535 1)))
+                  remote-prio (or (:priority stun-res)
+                                  (sdp/compute-candidate-priority (if prflx-cand :prflx (if relay-active? :relay :host)) 65535 1))
                   use-candidate? (boolean (:use-candidate? stun-res))
                   nom-policy (or (:nomination-policy state) :aggressive)
                   should-nominate? (if (= curr-role :controlling)
@@ -485,12 +488,18 @@
      :local-priority (or (:local-priority options)
                          (sdp/compute-candidate-priority (or (:candidate-type options) :host) 65535 1))
      :turn-client (when-let [tc (:turn-config options)] (turn/init-turn-client tc))
-     :turn-server-addr (when-let [tc (:turn-config options)] (handlers/resolve-candidate-target (:server-addr tc)))
-     :use-turn-relay? (boolean (if (contains? options :use-turn-relay?)
+     :turn-server-addr (when-let [tc (:turn-config options)]
+                         (handlers/resolve-candidate-target
+                          (or (:server-addr tc)
+                              (when (:server-host tc)
+                                {:ip (:server-host tc) :port (int (or (:server-port tc) 3478))}))))
+     :use-turn-relay? (boolean (if (some? (:use-turn-relay? options))
                                  (:use-turn-relay? options)
-                                 (if (contains? (:turn-config options) :force-relay?)
-                                   (get-in options [:turn-config :force-relay?])
-                                   (some? (:turn-config options)))))
+                                 (if (some? (get-in options [:turn-config :use-turn-relay?]))
+                                   (get-in options [:turn-config :use-turn-relay?])
+                                   (or (boolean (:force-relay? options))
+                                       (boolean (get-in options [:turn-config :force-relay?]))
+                                       (some? (:turn-config options))))))
      :ice-gathering-state :new
      :ice-connection-state :new
      :seen-candidates #{}

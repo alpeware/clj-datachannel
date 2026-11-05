@@ -700,7 +700,9 @@
    :password (:password opts)
    :realm (:realm opts)
    :nonce (:nonce opts)
-   :server-addr (:server-addr opts)
+   :server-addr (or (:server-addr opts)
+                    (when (:server-host opts)
+                      {:ip (:server-host opts) :port (int (or (:server-port opts) 3478))}))
    :lifetime (long (or (:lifetime opts) 600))
    :allocated-at-ms nil
    :expires-at-ms nil
@@ -914,39 +916,66 @@
                 new-client-state (update client-state :pending-tx dissoc tx-k)
                 msg-type (:msg-type parsed)]
             (cond
-              ;; 401 Unauthorized Challenge on Allocate (bounded retry up to :max-auth-retries)
-              (and (= msg-type METHOD_ALLOCATE_ERROR)
-                   (= (:error-code parsed) 401)
+              ;; 401 Unauthorized / 438 Stale Nonce Challenge on Allocate, Refresh, CreatePermission, or ChannelBind
+              ;; (bounded retry up to :max-auth-retries)
+              (and (#{METHOD_ALLOCATE_ERROR
+                      METHOD_REFRESH_ERROR
+                      METHOD_CREATE_PERMISSION_ERROR
+                      METHOD_CHANNEL_BIND_ERROR} msg-type)
+                   (#{401 438} (:error-code parsed))
                    (:realm parsed)
                    (:nonce parsed))
               (let [retries (long (or (:auth-retries client-state) 0))
-                    max-retries (long (or (:max-auth-retries client-state) 1))]
-                (if (and (#{:allocate :allocate-auth nil} (:action pending))
+                    max-retries (long (or (:max-auth-retries client-state) 1))
+                    act (:action pending)]
+                (if (and (#{:allocate :allocate-auth :refresh :create-permission :channel-bind nil} act)
                          (< retries max-retries))
                   (let [realm (:realm parsed)
                         nonce (:nonce parsed)
                         retry-tx-id (let [t (byte-array 12)] (.nextBytes secure-rand t) t)
                         retry-tx-k (tx-key retry-tx-id)
-                        auth-alloc (make-allocate-request (:username client-state)
-                                                          realm
-                                                          (:password client-state)
-                                                          nonce
-                                                          {:tx-id retry-tx-id :lifetime (:lifetime client-state)})]
+                        user (:username client-state)
+                        pass (:password client-state)
+                        [retry-pkt retry-pending next-st]
+                        (case act
+                          :refresh
+                          (let [lt (or (:lifetime pending) (:lifetime client-state) 600)]
+                            [(make-refresh-request user realm pass nonce lt {:tx-id retry-tx-id})
+                             {:action :refresh :lifetime lt :sent-at-ms now}
+                             (:state client-state)])
+
+                          :create-permission
+                          (let [pa (:peer-addr pending)]
+                            [(make-create-permission-request user realm pass nonce pa {:tx-id retry-tx-id})
+                             {:action :create-permission :peer-addr pa}
+                             (:state client-state)])
+
+                          :channel-bind
+                          (let [ch (:channel-number pending)
+                                pa (:peer-addr pending)]
+                            [(make-channel-bind-request user realm pass nonce ch pa {:tx-id retry-tx-id})
+                             {:action :channel-bind :channel-number ch :peer-addr pa}
+                             (:state client-state)])
+
+                          ;; default: :allocate / :allocate-auth / nil
+                          [(make-allocate-request user realm pass nonce {:tx-id retry-tx-id :lifetime (:lifetime client-state)})
+                           {:action :allocate-auth}
+                           :allocating-authenticated])]
                     {:new-state (-> new-client-state
-                                    (assoc :state :allocating-authenticated
+                                    (assoc :state next-st
                                            :realm realm
                                            :nonce nonce
                                            :auth-retries (inc retries))
-                                    (assoc-in [:pending-tx retry-tx-k] {:action :allocate-auth}))
-                     :network-out [auth-alloc]
-                     :events [{:type :turn-challenge-retry :realm realm :nonce nonce}]})
+                                    (assoc-in [:pending-tx retry-tx-k] retry-pending))
+                     :network-out [retry-pkt]
+                     :events [{:type :turn-challenge-retry :realm realm :nonce nonce :action (or act :allocate)}]})
                   {:new-state (assoc new-client-state
                                      :state :error
                                      :last-error :turn-auth-retry-exhausted)
                    :network-out []
                    :events [{:type :turn-error
                              :reason :turn-auth-retry-exhausted
-                             :error-code 401
+                             :error-code (:error-code parsed)
                              :msg-type msg-type}]}))
 
               ;; Non-401 (or unretryable) TURN Error Responses
@@ -1008,7 +1037,9 @@
                    :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
                   (let [peer-addr (:peer-addr pending)
                         ip (when peer-addr (peer-ip peer-addr))
-                        st (update new-client-state :permissions (fnil conj #{}) (or ip (str peer-addr)))]
+                        st (-> new-client-state
+                               (assoc :auth-retries 0)
+                               (update :permissions (fnil conj #{}) (or ip (str peer-addr))))]
                     {:new-state st
                      :network-out []
                      :events [{:type :turn-permission-created :peer-address peer-addr}]})))
@@ -1026,7 +1057,7 @@
                         peer-addr (:peer-addr pending)
                         ip (when peer-addr (peer-ip peer-addr))
                         st (-> new-client-state
-                               (assoc :state :channel-bound)
+                               (assoc :state :channel-bound :auth-retries 0)
                                (assoc-in [:channels ch] peer-addr)
                                (assoc-in [:peer->channel (str peer-addr)] ch)
                                (cond-> ip (assoc-in [:peer->channel ip] ch))
@@ -1048,6 +1079,7 @@
                         exp-at (if (zero? lt) now (+ now (* lt 1000)))
                         ref-at (if (zero? lt) nil (+ now (* (long (* lt 0.8)) 1000)))
                         st (assoc new-client-state
+                                  :auth-retries 0
                                   :lifetime lt
                                   :allocated-at-ms (if (zero? lt) (:allocated-at-ms new-client-state) now)
                                   :expires-at-ms exp-at
