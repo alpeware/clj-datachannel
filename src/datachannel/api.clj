@@ -688,7 +688,7 @@
                                                    :ice-pwd (:pwd ice-creds)})
                                            false))
                         :channel (atom client-ch)
-                        :selector (atom selector)
+                        :selector (atom nil)
                         :loop-future (atom nil)
                         :remote-addr (atom remote-addr)
                         :deframer-atom (atom (byte-array 0))
