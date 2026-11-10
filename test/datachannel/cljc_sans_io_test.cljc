@@ -7,6 +7,7 @@
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [datachannel.api :as api]
             [datachannel.buffer :as b]
             [datachannel.core :as dc]
             [datachannel.dcep :as dcep]
@@ -76,6 +77,9 @@
     (let [msg (b/utf8->bytes "The quick brown fox jumps over the lazy dog")
           key-str "key"]
       (is (= "The quick brown fox jumps over the lazy dog" (b/bytes->utf8 msg)))
+      (is (= "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12" (b/bytes->hex (b/sha1-bytes msg))))
+      (is (= "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
+             (b/bytes->hex (b/sha256-bytes msg))))
       (is (= "9e107d9d372bb6826bd81d3542a419d6" (b/bytes->hex (b/md5-bytes msg))))
       (is (= "de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9" (b/bytes->hex (b/hmac-sha1 key-str msg))))
       (is (= "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
@@ -483,4 +487,70 @@
                                    true)
           res (dc/handle-receive c0 (b/bytes-from-seq [22 3 253 0 0 0 0 0 0 0 1 0 1 1]) 2000)]
       (is (= :closed (:state (:new-state res))))
-      (is (some #(= (:type %) :on-error) (:app-events res))))))
+      (is (some #(= (:type %) :on-error) (:app-events res)))))
+
+  (testing "M2b: Real DTLS 1.2 engine (SSLEngine on JVM, node:crypto DTLS 1.2 on Node.js) + full SCTP/DCEP E2E + datachannel.api"
+    (let [node-a (api/create-node {:port 5000 :setup "active"})
+          node-b (api/create-node {:port 5001 :setup "passive"})
+          cert-a (:cert-data node-a)
+          cert-b (:cert-data node-b)
+          c0 (dc/create-connection {:ice-ufrag (get-in node-a [:ice-creds :ufrag])
+                                    :ice-pwd (get-in node-a [:ice-creds :pwd])
+                                    :remote-ice-ufrag (get-in node-b [:ice-creds :ufrag])
+                                    :remote-ice-pwd (get-in node-b [:ice-creds :pwd])
+                                    :remote-fingerprint (:fingerprint cert-b)
+                                    :remote-candidates ["127.0.0.1:5001"]
+                                    :cert-data cert-a}
+                                   true)
+          s0 (dc/create-connection {:ice-ufrag (get-in node-b [:ice-creds :ufrag])
+                                    :ice-pwd (get-in node-b [:ice-creds :pwd])
+                                    :remote-ice-ufrag (get-in node-a [:ice-creds :ufrag])
+                                    :remote-ice-pwd (get-in node-a [:ice-creds :pwd])
+                                    :remote-fingerprint (:fingerprint cert-a)
+                                    :cert-data cert-b}
+                                   false)
+          _ (dtls/begin-handshake! (:dtls/engine c0))
+          _ (dtls/begin-handshake! (:dtls/engine s0))
+          dtls-kickoff (-> (dc/handle-timeout c0 :dtls/flight-timeout 1100)
+                           (dc/serialize-network-out))
+          hs-res (pump-packets (:new-state dtls-kickoff)
+                               s0
+                               1200
+                               (:network-out-bytes dtls-kickoff)
+                               [])
+          c-est (:client-state hs-res)
+          s-est (:server-state hs-res)
+          _ (is (dtls/handshake-finished? (:dtls/engine c-est)))
+          _ (is (dtls/handshake-finished? (:dtls/engine s-est)))
+          _ (is (= (:fingerprint cert-b) (dtls/peer-fingerprint (:dtls/engine c-est))))
+          _ (is (= (:fingerprint cert-a) (dtls/peer-fingerprint (:dtls/engine s-est))))
+          _ (is (= :established (:state c-est)))
+          _ (is (= :established (:state s-est)))
+          aead-prop (tc/quick-check
+                     25
+                     (prop/for-all [bvec (gen/vector (gen/choose 0 255) 1 512)]
+                                   (let [plain (b/bytes-from-seq bvec)
+                                         enc (:bytes (dtls/wrap-app-data (:dtls/engine c-est) plain))
+                                         dec (:bytes (dtls/unwrap-packet (:dtls/engine s-est) enc))]
+                                     (b/bytes= plain dec))))
+          dc-open (-> (dc/create-data-channel c-est "bitecho" {:ordered true :protocol "fressian-v1"})
+                      (dc/serialize-network-out))
+          pumped-open (pump-packets (:new-state dc-open)
+                                    s-est
+                                    1300
+                                    (:network-out-bytes dc-open)
+                                    [])
+          msg-bytes (b/utf8->bytes "m2b-real-dtls12-sctp-payload")
+          send-res (-> (dc/send-data (:client-state pumped-open) msg-bytes 0 :webrtc/binary 1400)
+                       (dc/serialize-network-out))
+          rx-res (pump-packets (:new-state send-res)
+                               (:server-state pumped-open)
+                               1410
+                               (:network-out-bytes send-res)
+                               [])
+          msg-evt (first (filter #(= (:type %) :on-message) (:server-events rx-res)))]
+      (is (:pass? aead-prop) (pr-str aead-prop))
+      (is (some? msg-evt))
+      (is (b/bytes= msg-bytes (:payload msg-evt)))
+      (is (false? (api/should-reap-child? c-est 1500)))
+      (is (true? (api/should-reap-child? (assoc c-est :state :closed) 1500))))))

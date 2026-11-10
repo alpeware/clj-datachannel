@@ -560,8 +560,28 @@
                            0))))))))
 
 ;; =============================================================================
-;; 6. Portable HMAC-SHA1, HMAC-SHA256, and MD5
+;; 6. Portable SHA-1, SHA-256, HMAC-SHA1, HMAC-SHA256, and MD5
 ;; =============================================================================
+
+(defn sha1-bytes
+  "Computes 20-byte SHA-1 digest of `data-bytes-or-str`."
+  [data-bytes-or-str]
+  (let [d-bytes (if (string? data-bytes-or-str) (utf8->bytes data-bytes-or-str) (to-bytes data-bytes-or-str))]
+    #?(:clj (let [md (MessageDigest/getInstance "SHA-1")]
+              (.digest md ^bytes d-bytes))
+       :cljs (let [hash (.createHash node-crypto "sha1")]
+               (.update hash (js/Buffer.from d-bytes))
+               (js/Uint8Array. (.digest hash))))))
+
+(defn sha256-bytes
+  "Computes 32-byte SHA-256 digest of `data-bytes-or-str`."
+  [data-bytes-or-str]
+  (let [d-bytes (if (string? data-bytes-or-str) (utf8->bytes data-bytes-or-str) (to-bytes data-bytes-or-str))]
+    #?(:clj (let [md (MessageDigest/getInstance "SHA-256")]
+              (.digest md ^bytes d-bytes))
+       :cljs (let [hash (.createHash node-crypto "sha256")]
+               (.update hash (js/Buffer.from d-bytes))
+               (js/Uint8Array. (.digest hash))))))
 
 (defn hmac-sha1
   "Computes 20-byte HMAC-SHA1 over `data-bytes` with `key-bytes-or-str`."
