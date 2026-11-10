@@ -30,8 +30,8 @@
   "Prepares a node without starting the network loop.
   `opts` should contain `:port` and optionally `:setup` (e.g. \"active\" or \"passive\")."
   [opts]
-  (let [ice-creds (sdp/generate-ice-credentials)
-        cert-data (dtls/generate-cert)
+  (let [ice-creds (or (:ice-creds opts) (sdp/generate-ice-credentials))
+        cert-data (or (:cert-data opts) (dtls/generate-cert))
         port (get opts :port 5000)
         setup (get opts :setup "passive")
         local-sdp-params {:port port
@@ -130,7 +130,9 @@
                                 (update :send-errors (fnil inc 0))
                                 (assoc :last-send-error (or (.getMessage e) (.getName (class e))))))))))))
          :cljs
-         (if (:tcp? node)
+         (if (or (:tcp? node)
+                 (and (fn? (.-write ^js channel))
+                      (nil? (.-send ^js channel))))
            (doseq [buf network-out-bytes]
              (try
                (let [raw (if (and (map? buf) (:packet buf)) (:packet buf) buf)
