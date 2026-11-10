@@ -12,6 +12,7 @@
             [datachannel.core :as dc]
             [datachannel.dcep :as dcep]
             [datachannel.dtls :as dtls]
+            [datachannel.mdns :as mdns]
             [datachannel.sctp :as sctp]
             [datachannel.sdp :as sdp]
             [datachannel.stun :as stun]
@@ -562,3 +563,83 @@
                                                         (b/bytes-from-seq [23 0x03 0x03 0 1 0 0 0 0 0 0 0 1 0xAA]))))))
       (is (false? (api/should-reap-child? c-est 1500)))
       (is (true? (api/should-reap-child? (assoc c-est :state :closed) 1500))))))
+
+;; =============================================================================
+;; 11. RFC 6762 Multicast DNS (`datachannel.mdns`) Codec & Candidate Resolution
+;; =============================================================================
+
+(def ^:private gen-mdns-label
+  (gen/fmap (fn [chars]
+              (str "a" (apply str chars) "z"))
+            (gen/vector (gen/elements (vec "abcdefghijklmnopqrstuvwxyz0123456789-")) 4 22)))
+
+(def ^:private gen-ipv4-str
+  (gen/fmap (fn [[a b c d]]
+              (str a "." b "." c "." d))
+            (gen/tuple (gen/choose 1 223)
+                       (gen/choose 0 255)
+                       (gen/choose 0 255)
+                       (gen/choose 1 254))))
+
+(deftest mdns-codec-and-candidate-resolution-test
+  (testing "Generative roundtrip for RFC 6762 mDNS query/response packets, state machine, and SDP candidate resolution"
+    (let [res (tc/quick-check
+               50
+               (prop/for-all [label gen-mdns-label
+                              ip-str gen-ipv4-str
+                              ttl (gen/choose 10 3600)
+                              port (gen/choose 1024 65535)
+                              unicast? gen/boolean
+                              flush? gen/boolean]
+                             (let [hostname (str (str/lower-case label) ".local")
+                                   q-pkt (mdns/encode-mdns-query hostname {:qtype 1 :unicast-response? unicast?})
+                                   q-dec (mdns/decode-mdns-packet q-pkt)
+                                   q-first (first (:questions q-dec))
+                                   r-pkt (mdns/encode-mdns-response {:hostname hostname
+                                                                     :ip ip-str
+                                                                     :ttl ttl
+                                                                     :cache-flush? flush?})
+                                   r-dec (mdns/decode-mdns-packet r-pkt)
+                                   a-first (first (:answers r-dec))
+                                   ;; Pure responder & cache state-machine flow
+                                   host-table (-> (mdns/init-mdns-table)
+                                                  (mdns/register-local-host hostname ip-str ttl))
+                                   q-step (mdns/handle-mdns-packet host-table q-pkt 1000)
+                                   peer-table (mdns/init-mdns-table)
+                                   r-step (mdns/handle-mdns-packet peer-table (:response-bytes q-step) 1000)
+                                   cand-str (sdp/format-candidate {:foundation "1"
+                                                                   :component 1
+                                                                   :transport "UDP"
+                                                                   :type "host"
+                                                                   :ip hostname
+                                                                   :port port})
+                                   parsed-cand (sdp/parse-candidate cand-str)
+                                   resolved-cand (mdns/resolve-candidate-address parsed-cand (:state r-step) 1000)]
+                               (and (mdns/mdns-hostname? hostname)
+                                    (mdns/mdns-hostname? (str hostname "."))
+                                    (not (mdns/mdns-hostname? ip-str))
+                                    (not (mdns/mdns-hostname? "nexus.ingress.bitecho.org"))
+                                    (false? (:qr? q-dec))
+                                    (= 0 (:id q-dec))
+                                    (= hostname (:qname q-first))
+                                    (= 1 (:qtype q-first))
+                                    (= unicast? (:unicast-response? q-first))
+                                    (true? (:qr? r-dec))
+                                    (true? (:aa? r-dec))
+                                    (= hostname (:name a-first))
+                                    (= 1 (:type a-first))
+                                    (= ttl (:ttl a-first))
+                                    (= flush? (:cache-flush? a-first))
+                                    (= ip-str (:ip a-first))
+                                    (some? (:response-bytes q-step))
+                                    (= ip-str (get (:resolved r-step) hostname))
+                                    (= ip-str (:ip resolved-cand))
+                                    (= hostname (:mdns-hostname resolved-cand))
+                                    (= port (:port resolved-cand))))))]
+      (is (:pass? res) (pr-str res))
+      (let [gen-host (mdns/generate-mdns-hostname)
+            empty-tab (mdns/init-mdns-table)
+            bad-step (mdns/handle-mdns-packet empty-tab (b/bytes-from-seq [1 2 3]) 1000)]
+        (is (mdns/mdns-hostname? gen-host))
+        (is (nil? (mdns/decode-mdns-packet (b/bytes-from-seq [1 2 3]))))
+        (is (= 1 (get-in bad-step [:state :diagnostics :ignored-malformed])))))))
