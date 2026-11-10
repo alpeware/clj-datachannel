@@ -69,10 +69,12 @@
       (is (:pass? res) (pr-str res)))))
 
 (deftest crc-and-crypto-vectors-test
-  (testing "IEEE CRC32 and Castagnoli CRC32C match standard '123456789' test vectors"
+  (testing "IEEE CRC32 and Castagnoli CRC32C match standard '123456789' test vectors for both byte[] and String (F1)"
     (let [input (b/utf8->bytes "123456789")]
       (is (= 0xCBF43926 (b/crc32-ieee input)))
-      (is (= 0xE3069283 (b/crc32c input)))))
+      (is (= 0xCBF43926 (b/crc32-ieee "123456789")))
+      (is (= 0xE3069283 (b/crc32c input)))
+      (is (= 0xE3069283 (b/crc32c "123456789")))))
   (testing "UTF-8, hex, Base64, MD5, HMAC-SHA1, and HMAC-SHA256 are deterministic across JVM and Node.js"
     (let [msg (b/utf8->bytes "The quick brown fox jumps over the lazy dog")
           key-str "key"]

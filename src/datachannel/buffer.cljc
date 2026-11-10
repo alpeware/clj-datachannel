@@ -515,9 +515,11 @@
        tbl)))
 
 (defn crc32-ieee
-  "Computes unsigned 32-bit IEEE 802.3 CRC32 over `buf-or-bytes`."
-  ^long [buf-or-bytes]
-  (let [bs (to-bytes buf-or-bytes)]
+  "Computes unsigned 32-bit IEEE 802.3 CRC32 over `buf-or-bytes-or-str`."
+  ^long [buf-or-bytes-or-str]
+  (let [bs (if (string? buf-or-bytes-or-str)
+             (utf8->bytes buf-or-bytes-or-str)
+             (to-bytes buf-or-bytes-or-str))]
     #?(:clj (let [crc (CRC32.)]
               (.update crc ^bytes bs)
               (.getValue crc))
@@ -535,19 +537,24 @@
                              0)))))))))
 
 (defn crc32c
-  "Computes unsigned 32-bit Castagnoli CRC32C over `buf-or-bytes`."
-  ^long [buf-or-bytes]
-  #?(:clj (if (instance? ByteBuffer buf-or-bytes)
+  "Computes unsigned 32-bit Castagnoli CRC32C over `buf-or-bytes-or-str`."
+  ^long [buf-or-bytes-or-str]
+  #?(:clj (if (instance? ByteBuffer buf-or-bytes-or-str)
             (let [crc (CRC32C.)]
-              (.update crc ^ByteBuffer buf-or-bytes)
+              (.update crc ^ByteBuffer buf-or-bytes-or-str)
               (.getValue crc))
-            (let [crc (CRC32C.)]
-              (.update crc ^bytes (to-bytes buf-or-bytes))
+            (let [bs (if (string? buf-or-bytes-or-str)
+                       (utf8->bytes buf-or-bytes-or-str)
+                       (to-bytes buf-or-bytes-or-str))
+                  crc (CRC32C.)]
+              (.update crc ^bytes bs)
               (.getValue crc)))
-     :cljs (let [bs (to-bytes buf-or-bytes)
+     :cljs (let [bs (if (string? buf-or-bytes-or-str)
+                      (utf8->bytes buf-or-bytes-or-str)
+                      (to-bytes buf-or-bytes-or-str))
                  len (blength bs)]
-             (when (satisfies? IBinaryBuffer buf-or-bytes)
-               (buf-set-position! buf-or-bytes (buf-limit buf-or-bytes)))
+             (when (satisfies? IBinaryBuffer buf-or-bytes-or-str)
+               (buf-set-position! buf-or-bytes-or-str (buf-limit buf-or-bytes-or-str)))
              (loop [i 0
                     c 0xFFFFFFFF]
                (if (= i len)
