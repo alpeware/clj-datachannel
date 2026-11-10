@@ -1,23 +1,16 @@
 (ns datachannel.handlers
-  (:require [clojure.string :as str]
+  (:require [datachannel.buffer :as b]
             [datachannel.chunks :as chunks]
             [datachannel.dtls :as dtls]
             [datachannel.packetize :as packetize]
             [datachannel.stun :as stun]
-            [datachannel.turn :as turn])
-  (:import [java.net InetSocketAddress]))
+            [datachannel.turn :as turn]))
 
 (defn resolve-candidate-target
-  "Resolves a candidate (InetSocketAddress, 'ip:port' string, or {:ip :port} map) into an InetSocketAddress."
+  "Resolves a candidate (InetSocketAddress, 'ip:port' string, or {:ip :port} map)
+   into a platform socket address (`InetSocketAddress` on JVM, `{:ip :port}` on CLJS)."
   [cand]
-  (cond
-    (instance? InetSocketAddress cand) cand
-    (and (map? cand) (:ip cand) (:port cand))
-    (InetSocketAddress. ^String (str (:ip cand)) (Integer/parseInt (str (:port cand))))
-    (and (string? cand) (str/includes? cand ":"))
-    (let [[ip port] (str/split cand #":")]
-      (InetSocketAddress. ^String ip (Integer/parseInt port)))
-    :else cand))
+  (b/to-socket-address cand))
 
 (defn wrap-turn-packets
   "Targets TURN control packets to `turn-server-addr` when configured."
@@ -124,8 +117,6 @@
           (if item-max-retries
             ;; Partial reliability: abandon message and send FORWARD-TSN
             (let [;; Find all chunks belonging to the same user message (until we see ending flag)
-                  ;; SCTP flags: B=2, E=1. If B is not set, we might be in the middle of a message.
-                  ;; For simplicity, we drop from the front until we hit an item where (bit-and flags 1) is non-zero (ending=true)
                   dropped-items (loop [items []
                                        rem-q q]
                                   (if (empty? rem-q)
@@ -137,24 +128,21 @@
                                         (recur (conj items it) (rest rem-q))))))
                   new-q (vec (drop (count dropped-items) q))
                   last-dropped-tsn (:tsn (last dropped-items))
-                  ;; Only subtract bytes for chunks that were actually sent (in flight)
-                  abandoned-bytes (reduce + (map #(if (:sent? %) (+ 16 (if (:payload (:chunk %)) (alength ^bytes (:payload (:chunk %))) 0)) 0) dropped-items))
+                  abandoned-bytes (reduce + (map #(if (:sent? %) (+ 16 (b/blength (:payload (:chunk %)))) 0) dropped-items))
                   new-flight-size (max 0 (- (get state :flight-size 0) abandoned-bytes))
-                  ;; Extract stream-id and seq-num from the first dropped item for the FORWARD-TSN payload
                   stream-id-to-fwd (get-in (first dropped-items) [:chunk :stream-id] stream-id)
                   seq-num-to-fwd (get-in (first dropped-items) [:chunk :seq-num] 0)
                   forward-tsn-chunk {:type :forward-tsn :new-cumulative-tsn last-dropped-tsn :streams [{:stream-id stream-id-to-fwd :stream-sequence seq-num-to-fwd}]}
                   s1 (-> state
                          (assoc-in [:streams stream-id :send-queue] new-q)
                          (assoc :flight-size new-flight-size)
-                         (update-in [:metrics :unacked-data] #(max 0 (- (or % 0) (reduce + (map (fn [item] (+ 16 (if-let [p (:payload (:chunk item))] (alength ^bytes p) 0))) dropped-items)))))
+                         (update-in [:metrics :unacked-data] #(max 0 (- (or % 0) (reduce + (map (fn [item] (+ 16 (b/blength (:payload (:chunk item))))) dropped-items)))))
                          (update :pending-control-chunks conj forward-tsn-chunk))
                   s2 (if (empty? new-q)
                        (update s1 :timers dissoc :sctp/t3-rtx)
                        s1)
-
-                  old-buffered (reduce + (map #(if-let [p (:payload (:chunk %))] (alength ^bytes p) 0) q))
-                  new-buffered (reduce + (map #(if-let [p (:payload (:chunk %))] (alength ^bytes p) 0) new-q))
+                  old-buffered (reduce + (map #(b/blength (:payload (:chunk %))) q))
+                  new-buffered (reduce + (map #(b/blength (:payload (:chunk %))) new-q))
                   low-threshold (get state :buffered-amount-low-threshold 0)
                   app-events (if (and (> old-buffered low-threshold) (<= new-buffered low-threshold))
                                [{:type :on-buffered-amount-low :stream-id stream-id}]
@@ -180,16 +168,13 @@
                 new-cwnd (* 1 mtu)
 
                 ;; flight-size logic: decrease flight-size because we mark it sent?=false
-                chunk-size (+ 16 (if (:payload (:chunk first-item)) (alength ^bytes (:payload (:chunk first-item))) 0))
+                chunk-size (+ 16 (b/blength (:payload (:chunk first-item))))
                 flight-size (max 0 (- (get state :flight-size 0) chunk-size))]
             {:new-state (-> state
                             (assoc-in [:timers :sctp/t3-rtx] {:expires-at (+ now-ms new-delay) :delay new-delay})
                             (update-in [:metrics :retransmissions] (fnil inc 0))
                             (assoc-in [:streams stream-id :send-queue] new-q)
                             (assoc :ssthresh new-ssthresh)
-                            ;; Set cwnd to accommodate at least the MTU, fast retransmit logic requires flight-size to drop.
-                            ;; If flight-size + chunk-size > cwnd, packetize won't pull.
-                            ;; Here we set cwnd to something large enough, or just MTU but ensure flight-size is updated properly.
                             (assoc :cwnd (max new-cwnd (+ flight-size chunk-size)))
                             (assoc :flight-size flight-size))
              :app-events []}))))))
@@ -198,7 +183,7 @@
   (let [interval (get state :heartbeat-interval 30000)
         rto (get state :rto-initial 1000)
         hb-chunk {:type :heartbeat
-                  :params {:heartbeat (byte-array 8)}}]
+                  :params {:heartbeat (b/alloc-bytes 8)}}]
     {:new-state (-> state
                     (assoc-in [:timers :sctp/t-heartbeat] {:expires-at (+ now-ms interval)})
                     (assoc-in [:timers :sctp/t-heartbeat-rtx] {:expires-at (+ now-ms rto)})
@@ -295,19 +280,15 @@
      :app-events []}))
 
 (defmethod handle-timeout-timer :dtls/flight-timeout [state _timer-id now-ms]
-  (if-let [^javax.net.ssl.SSLEngine engine (:dtls/engine state)]
-    (let [hs-status (.getHandshakeStatus engine)]
-      (if (or (= hs-status javax.net.ssl.SSLEngineResult$HandshakeStatus/FINISHED)
-              (= hs-status javax.net.ssl.SSLEngineResult$HandshakeStatus/NOT_HANDSHAKING))
-        {:new-state (update state :timers dissoc :dtls/flight-timeout)
-         :network-out []
-         :app-events []}
-        (let [out-buf (java.nio.ByteBuffer/allocateDirect 65536)
-              empty-in (java.nio.ByteBuffer/allocateDirect 0)
-              {:keys [packets]} (dtls/handshake engine empty-in out-buf)]
-          {:new-state (assoc-in state [:timers :dtls/flight-timeout] {:expires-at (+ now-ms 1000)})
-           :network-out (vec packets)
-           :app-events []})))
+  (if-let [engine (:dtls/engine state)]
+    (if (dtls/handshake-finished? engine)
+      {:new-state (update state :timers dissoc :dtls/flight-timeout)
+       :network-out []
+       :app-events []}
+      (let [{:keys [packets]} (dtls/handshake-step engine b/empty-bytes)]
+        {:new-state (assoc-in state [:timers :dtls/flight-timeout] {:expires-at (+ now-ms 1000)})
+         :network-out (vec packets)
+         :app-events []}))
     {:new-state (update state :timers dissoc :dtls/flight-timeout)
      :network-out []
      :app-events []}))
@@ -317,7 +298,7 @@
 
 (defn handle-timeout
   "Routes timer expiries to `handle-timeout-timer` and feeds the resulting state transitions through the `packetize` network generation pipeline."
-  [state timer-id now-ms & [^javax.net.ssl.SSLEngine _engine]]
+  [state timer-id now-ms & [_engine]]
   (let [res (handle-timeout-timer state timer-id now-ms)]
     (if (or (seq (:pending-control-chunks (:new-state res)))
             (= "sctp" (namespace timer-id)))

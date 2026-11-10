@@ -1,6 +1,7 @@
 (ns datachannel.sdp
-  (:require [clojure.string :as str])
-  (:import [java.security SecureRandom]))
+  "Cross-platform RFC 5245 / RFC 8445 ICE candidate, priority, and SDP formatter/parser."
+  (:require [clojure.string :as str]
+            [datachannel.buffer :as b]))
 
 (def default-max-message-size
   "Default WebRTC SCTP maximum message size (256 KiB)."
@@ -11,9 +12,7 @@
   [sdp-str]
   (when (string? sdp-str)
     (when-let [[_ val-str] (re-find #"(?m)^a=max-message-size:(\d+)\r?$" sdp-str)]
-      (try
-        (Long/parseLong val-str)
-        (catch Exception _ nil)))))
+      (b/parse-int val-str nil))))
 
 (def ^:private type-preferences
   {"host" 126
@@ -67,11 +66,10 @@
 (defn generate-ice-credentials
   "Generates a secure ICE ufrag and pwd. The pwd must be at least 22 characters long (RFC 5245)."
   []
-  (let [random (SecureRandom.)
-        chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+  (let [chars "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         len (count chars)
         gen-str (fn [n]
-                  (apply str (repeatedly n #(nth chars (.nextInt random len)))))]
+                  (apply str (repeatedly n #(nth chars (b/random-int len)))))]
     {:ufrag (gen-str 8)
      :pwd   (gen-str 24)}))
 
@@ -96,18 +94,17 @@
 (defn parse-candidate
   "Extracts ICE candidate parameters (foundation, component, transport, priority,
    ip, port, type, raddr, rport, ufrag) from an RFC 5245 / RFC 8445 candidate string."
-  [^String candidate-str]
-  (let [cleaned (-> (str/trim candidate-str)
+  [candidate-str]
+  (let [cleaned (-> (str/trim (or candidate-str ""))
                     (str/replace-first #"^a=" "")
                     (str/replace-first #"^candidate:" ""))
         parts (vec (str/split cleaned #"\s+"))
         foundation (get parts 0)
-        component (when-let [c (get parts 1)] (try (Integer/parseInt c) (catch Exception _ 1)))
+        component (when-let [c (get parts 1)] (int (b/parse-int c 1)))
         transport (get parts 2)
-        priority (when-let [p (get parts 3)] (try (Long/parseLong p) (catch Exception _ 0)))
+        priority (when-let [p (get parts 3)] (long (b/parse-int p 0)))
         ip (get parts 4)
-        port (when-let [pt (get parts 5)] (try (Integer/parseInt pt) (catch Exception _ 0)))
-        ;; Parse trailing keyword pairs like 'typ host', 'raddr 1.2.3.4', 'rport 1234', 'ufrag foo'
+        port (when-let [pt (get parts 5)] (int (b/parse-int pt 0)))
         trailing-map (loop [idx 6
                             m {}]
                        (if (>= idx (count parts))
@@ -119,7 +116,9 @@
                              m))))
         cand-type (get trailing-map "typ")
         raddr (get trailing-map "raddr")
-        rport (when-let [rp (get trailing-map "rport")] (try (Integer/parseInt rp) (catch Exception _ nil)))
+        rport (when-let [rp (get trailing-map "rport")]
+                (when-let [parsed-rp (b/parse-int rp nil)]
+                  (int parsed-rp)))
         ufrag (get trailing-map "ufrag")]
     (cond-> {:ip ip
              :port port}

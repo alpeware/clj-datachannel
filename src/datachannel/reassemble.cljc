@@ -1,20 +1,12 @@
 (ns datachannel.reassemble
-  (:require [datachannel.dcep :as dcep]))
+  "Cross-platform SCTP stream reassembler and DCEP frame interceptor."
+  (:require [datachannel.buffer :as b]
+            [datachannel.dcep :as dcep]))
 
 (defn assemble-payload
   "Concatenates the payloads of a sequence of ordered SCTP fragments into a single contiguous byte array."
   [chunks]
-  (let [total-len (reduce + (map #(alength ^bytes (:payload %)) chunks))
-        result (byte-array total-len)]
-    (loop [cs chunks
-           offset 0]
-      (if (empty? cs)
-        result
-        (let [c (first cs)
-              p (:payload c)
-              len (alength ^bytes p)]
-          (System/arraycopy p 0 result offset len)
-          (recur (rest cs) (+ offset len)))))))
+  (b/bconcat (map :payload chunks)))
 
 (defn reassemble-stream
   "Processes the receive queue of an SCTP stream according to RFC 4960, un-fragmenting and ordering inbound data chunks based on Stream Sequence Numbers and U/B/E bits."
@@ -37,28 +29,24 @@
           (if u-bit?
             ;; Unordered
             (if (and b-bit? e-bit?)
-              ;; Single chunk Unordered
               (recur (rest remaining)
                      []
                      new-q
                      (conj app-events {:type :on-message :payload (:payload chunk) :stream-id (:stream-id chunk) :protocol (:protocol chunk)})
                      next-ssn)
               (if b-bit?
-                ;; Start of fragmented Unordered
                 (recur (rest remaining)
                        [chunk]
                        new-q
                        app-events
                        next-ssn)
                 (if e-bit?
-                  ;; End of fragmented Unordered
                   (let [full-msg (conj current-msg chunk)]
                     (recur (rest remaining)
                            []
                            new-q
                            (conj app-events {:type :on-message :payload (assemble-payload full-msg) :stream-id (:stream-id chunk) :protocol (:protocol chunk)})
                            next-ssn))
-                  ;; Middle of fragmented Unordered
                   (recur (rest remaining)
                          (conj current-msg chunk)
                          new-q
@@ -67,21 +55,18 @@
             ;; Ordered
             (if (= (:seq-num chunk) next-ssn)
               (if (and b-bit? e-bit?)
-                ;; Single chunk Ordered
                 (recur (rest remaining)
                        []
                        new-q
                        (conj app-events {:type :on-message :payload (:payload chunk) :stream-id (:stream-id chunk) :protocol (:protocol chunk)})
                        (inc next-ssn))
                 (if b-bit?
-                  ;; Start of fragmented Ordered
                   (recur (rest remaining)
                          [chunk]
                          new-q
                          app-events
                          next-ssn)
                   (if (empty? current-msg)
-                    ;; Received a middle or end chunk without a start chunk, leave it in queue
                     (recur (rest remaining)
                            current-msg
                            (conj new-q chunk)
@@ -91,26 +76,22 @@
                           expected-tsn (inc (:tsn last-chunk))]
                       (if (= (:tsn chunk) expected-tsn)
                         (if e-bit?
-                          ;; End of fragmented Ordered
                           (let [full-msg (conj current-msg chunk)]
                             (recur (rest remaining)
                                    []
                                    new-q
                                    (conj app-events {:type :on-message :payload (assemble-payload full-msg) :stream-id (:stream-id chunk) :protocol (:protocol chunk)})
                                    (inc next-ssn)))
-                          ;; Middle of fragmented Ordered
                           (recur (rest remaining)
                                  (conj current-msg chunk)
                                  new-q
                                  app-events
                                  next-ssn))
-                        ;; TSN gap detected inside fragmented message, put back in queue
                         (recur (rest remaining)
                                current-msg
                                (conj new-q chunk)
                                app-events
                                next-ssn))))))
-              ;; Not expected SSN, hold in queue
               (recur (rest remaining)
                      current-msg
                      (conj new-q chunk)
@@ -128,7 +109,7 @@
         {:new-state current-state :app-events current-events}
         (let [stream-id (first stream-ids)
               stream-data (get-in current-state [:streams stream-id])
-              {:keys [new-stream app-events] :as _res} (reassemble-stream stream-data)
+              {:keys [new-stream app-events]} (reassemble-stream stream-data)
               app-events-stream app-events
               dcep-events (filter #(= (:protocol %) :webrtc/dcep) app-events-stream)
               non-dcep-events (filter #(not= (:protocol %) :webrtc/dcep) app-events-stream)

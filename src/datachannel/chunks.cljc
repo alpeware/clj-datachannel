@@ -1,48 +1,38 @@
 (ns datachannel.chunks
-  (:import [java.nio ByteBuffer]
-           [javax.crypto Mac]
-           [javax.crypto.spec SecretKeySpec]
-           [java.security MessageDigest]))
+  "Cross-platform SCTP chunk processor (DATA, INIT, INIT-ACK, COOKIE-ECHO, COOKIE-ACK, SACK, HEARTBEAT, SHUTDOWN, FORWARD-TSN)."
+  (:require [datachannel.buffer :as b]))
 
 (defn- generate-cookie
   "Generates an HMAC-SHA256 signed cookie encapsulating the TCB parameters to prevent SYN-flood state exhaustion."
   [secret remote-ver-tag remote-tsn negotiated-outbound-streams negotiated-inbound-streams]
-  (let [buf (ByteBuffer/allocate 16)
-        _ (.putInt buf (unchecked-int remote-ver-tag))
-        _ (.putInt buf (unchecked-int remote-tsn))
-        _ (.putInt buf (unchecked-int negotiated-outbound-streams))
-        _ (.putInt buf (unchecked-int negotiated-inbound-streams))
-        payload (.array buf)
-        mac (Mac/getInstance "HmacSHA256")
-        key-spec (SecretKeySpec. ^bytes secret "HmacSHA256")
-        _ (.init mac key-spec)
-        signature (.doFinal mac payload)
-        cookie-buf (ByteBuffer/allocate (+ 16 (alength ^bytes signature)))
-        _ (.put cookie-buf payload)
-        _ (.put cookie-buf signature)]
-    (.array cookie-buf)))
+  (let [buf (b/allocate-buffer 16)
+        _ (b/buf-put-u32! buf remote-ver-tag)
+        _ (b/buf-put-u32! buf remote-tsn)
+        _ (b/buf-put-u32! buf negotiated-outbound-streams)
+        _ (b/buf-put-u32! buf negotiated-inbound-streams)
+        _ (b/buf-flip! buf)
+        payload (b/buf->bytes buf)
+        signature (b/hmac-sha256 secret payload)]
+    (b/bconcat [payload signature])))
 
 (defn- verify-and-extract-cookie
   "Verifies the HMAC-SHA256 signature of a received cookie and returns the encapsulated TCB parameters if valid."
-  [secret ^bytes cookie]
-  (if (or (nil? cookie) (< (alength cookie) 48)) ; 16 bytes payload + 32 bytes SHA256 signature
+  [secret cookie]
+  (if (or (nil? cookie) (< (b/blength cookie) 48)) ; 16 bytes payload + 32 bytes SHA256 signature
     nil
-    (let [payload (java.util.Arrays/copyOfRange cookie 0 16)
-          received-sig (java.util.Arrays/copyOfRange cookie 16 (alength cookie))
-          mac (Mac/getInstance "HmacSHA256")
-          key-spec (SecretKeySpec. ^bytes secret "HmacSHA256")
-          _ (.init mac key-spec)
-          expected-sig (.doFinal mac payload)]
-      (if (MessageDigest/isEqual ^bytes expected-sig ^bytes received-sig)
-        (let [buf (ByteBuffer/wrap payload)
-              remote-ver-tag (.getInt buf)
-              remote-tsn (.getInt buf)
-              negotiated-outbound-streams (.getInt buf)
-              negotiated-inbound-streams (.getInt buf)]
-          {:remote-ver-tag (if (< remote-ver-tag 0) (+ 4294967296 remote-ver-tag) remote-ver-tag)
-           :remote-tsn (if (< remote-tsn 0) (+ 4294967296 remote-tsn) remote-tsn)
-           :negotiated-outbound-streams (if (< negotiated-outbound-streams 0) (+ 4294967296 negotiated-outbound-streams) negotiated-outbound-streams)
-           :negotiated-inbound-streams (if (< negotiated-inbound-streams 0) (+ 4294967296 negotiated-inbound-streams) negotiated-inbound-streams)})
+    (let [payload (b/bslice cookie 0 16)
+          received-sig (b/bslice cookie 16 (b/blength cookie))
+          expected-sig (b/hmac-sha256 secret payload)]
+      (if (b/bytes= expected-sig received-sig)
+        (let [buf (b/wrap-buffer payload)
+              remote-ver-tag (b/buf-get-u32! buf)
+              remote-tsn (b/buf-get-u32! buf)
+              negotiated-outbound-streams (b/buf-get-u32! buf)
+              negotiated-inbound-streams (b/buf-get-u32! buf)]
+          {:remote-ver-tag remote-ver-tag
+           :remote-tsn remote-tsn
+           :negotiated-outbound-streams negotiated-outbound-streams
+           :negotiated-inbound-streams negotiated-inbound-streams})
         nil))))
 
 (defmulti process-chunk
@@ -68,17 +58,11 @@
               (recur (rest remaining) offset offset (conj blocks [current-start current-end])))))))))
 
 (defmethod process-chunk :data [state chunk _packet now-ms]
-  (let [_proto (:protocol chunk)
-        tsn (:tsn chunk)
+  (let [tsn (:tsn chunk)
         remote-tsn (get state :remote-tsn -1)
         ooo-tsns (get state :out-of-order-tsns (sorted-set))
-        ;; Proper RFC 4960 serial arithmetic for newer/older
-        diff (unchecked-int (unchecked-subtract (unchecked-int tsn) (unchecked-int remote-tsn)))
-        is-newer? (or (= remote-tsn -1) (> diff 0))
-        ;; It's old (already acked or out of bounds) if it's not newer and not in out-of-order-tsns
-        ;; But wait, out-of-order-tsns are newer than remote-tsn.
-        ;; So if it's <= remote-tsn (in serial math, i.e., not newer), it's either an old packet or a duplicate.
-        ;; For SCTP SACKs, duplicate-tsns are reported.
+        diff (b/s32-diff tsn remote-tsn)
+        is-newer? (or (= remote-tsn -1) (pos? diff))
         is-duplicate? (and (not is-newer?) (not= remote-tsn -1))]
     (if is-duplicate?
       (let [sack-chunk {:type :sack
@@ -94,17 +78,15 @@
       (let [expected-tsn (if (= remote-tsn -1) tsn (if (= remote-tsn 4294967295) 0 (inc remote-tsn)))
             is-contiguous? (= tsn expected-tsn)
             s1 (if is-contiguous?
-                 ;; Contiguous
                  (loop [curr-tsn tsn
                         curr-ooo ooo-tsns]
                    (let [next-tsn (if (= curr-tsn 4294967295) 0 (inc curr-tsn))]
                      (if (contains? curr-ooo next-tsn)
                        (recur next-tsn (disj curr-ooo next-tsn))
                        (assoc state :remote-tsn curr-tsn :out-of-order-tsns curr-ooo))))
-                 ;; Out of order
                  (assoc state :out-of-order-tsns (conj ooo-tsns tsn)))
 
-            unacked-chunks (if is-contiguous? (inc (get s1 :unacked-data-chunks 0)) 2) ; Out-of-order triggers immediate SACK
+            unacked-chunks (if is-contiguous? (inc (get s1 :unacked-data-chunks 0)) 2)
             send-sack-now? (>= unacked-chunks 2)
 
             s2 (if send-sack-now?
@@ -123,13 +105,13 @@
                    (assoc s-timers :unacked-data-chunks unacked-chunks)))
 
             stream-id (:stream-id chunk)
-            ;; We must fetch the queue directly from s2 rather than the incoming state
             recv-q (get-in s2 [:streams stream-id :recv-queue] [])
-            ;; Ensure that ANY chunk we receive (contiguous or not) goes into the receive queue for reassembly
             max-recv-q (get state :max-receive-queue-size)
-            new-chunk-len (if-let [p (:payload chunk)] (alength ^bytes p) 0)
-            recv-q-size (reduce + (map #(if-let [p (:payload %)] (alength ^bytes p) 0) recv-q))
-            new-recv-q (if (and max-recv-q (> (+ recv-q-size new-chunk-len) max-recv-q)) recv-q (if (some #(= (:tsn %) tsn) recv-q) recv-q (conj recv-q chunk)))
+            new-chunk-len (b/blength (:payload chunk))
+            recv-q-size (reduce + (map #(b/blength (:payload %)) recv-q))
+            new-recv-q (if (and max-recv-q (> (+ recv-q-size new-chunk-len) max-recv-q))
+                         recv-q
+                         (if (some #(= (:tsn %) tsn) recv-q) recv-q (conj recv-q chunk)))
             s3 (assoc-in s2 [:streams stream-id :recv-queue] new-recv-q)]
         {:next-state s3 :next-events []}))))
 
@@ -142,7 +124,7 @@
         negotiated-in (min local-in remote-out)
         remote-ver-tag (:init-tag chunk)
         remote-tsn (if (:initial-tsn chunk) (dec (:initial-tsn chunk)) -1)
-        cookie-secret (:cookie-secret state (byte-array 32))
+        cookie-secret (:cookie-secret state (b/alloc-bytes 32))
         cookie-bytes (generate-cookie cookie-secret remote-ver-tag remote-tsn negotiated-out negotiated-in)
         init-ack-chunk {:type :init-ack
                         :dest-ver-tag remote-ver-tag
@@ -188,7 +170,7 @@
         {:next-state s3 :next-events [{:type :on-error :cause :protocol-violation} {:type :on-close}]}))))
 
 (defmethod process-chunk :cookie-echo [state chunk _packet now-ms]
-  (if-let [tcb (verify-and-extract-cookie (:cookie-secret state (byte-array 32)) (:cookie chunk))]
+  (if-let [tcb (verify-and-extract-cookie (:cookie-secret state (b/alloc-bytes 32)) (:cookie chunk))]
     (let [interval (get state :heartbeat-interval 30000)
           s1 (-> state
                  (assoc :state :established
@@ -212,8 +194,7 @@
                s3)
           tx-bytes (reduce + (map (fn [st]
                                     (reduce + (map (fn [item]
-                                                     (let [dc (:chunk item)]
-                                                       (if (:payload dc) (alength ^bytes (:payload dc)) 0)))
+                                                     (b/blength (:payload (:chunk item))))
                                                    (:send-queue (val st)))))
                                   (:streams s4)))
           s5 (if (and just-established? has-buffered-data?)
@@ -253,8 +234,7 @@
              s4)
         tx-bytes (reduce + (map (fn [st]
                                   (reduce + (map (fn [item]
-                                                   (let [dc (:chunk item)]
-                                                     (if (:payload dc) (alength ^bytes (:payload dc)) 0)))
+                                                   (b/blength (:payload (:chunk item))))
                                                  (:send-queue (val st)))))
                                 (:streams s5)))
         s6 (if (and (contains? #{:cookie-wait :cookie-echoed} (:state state)) (= (:state s4) :established) has-buffered-data?)
@@ -271,22 +251,19 @@
   (let [cum-tsn-ack (:cum-tsn-ack chunk)
         streams (:streams state)
         mtu (get state :mtu 1200)
-        ;; Calculate newly acked bytes and reduce flight size
-        ;; Also collect the new queues
-        old-total-buffered (reduce + (map (fn [[_ v]] (reduce + (map #(if-let [p (:payload (:chunk %))] (alength ^bytes p) 0) (:send-queue v)))) streams))
+        old-total-buffered (reduce + (map (fn [[_ v]] (reduce + (map #(b/blength (:payload (:chunk %))) (:send-queue v)))) streams))
         res (reduce-kv
              (fn [acc k v]
                (let [q (:send-queue v)
-                     old-buffered (reduce + (map #(if-let [p (:payload (:chunk %))] (alength ^bytes p) 0) q))
+                     old-buffered (reduce + (map #(b/blength (:payload (:chunk %))) q))
                      acked-items (filter (fn [{:keys [tsn sent?]}]
-                                           (and sent? (not (pos? (unchecked-int (unchecked-subtract (unchecked-int tsn) (unchecked-int cum-tsn-ack)))))))
+                                           (and sent? (not (pos? (b/s32-diff tsn cum-tsn-ack)))))
                                          q)
-                     acked-bytes (reduce + (map #(let [payload (:payload (:chunk %))]
-                                                   (+ 16 (if payload (alength ^bytes payload) 0))) acked-items))
+                     acked-bytes (reduce + (map #(+ 16 (b/blength (:payload (:chunk %)))) acked-items))
                      new-q (vec (remove (fn [{:keys [tsn]}]
-                                          (not (pos? (unchecked-int (unchecked-subtract (unchecked-int tsn) (unchecked-int cum-tsn-ack))))))
+                                          (not (pos? (b/s32-diff tsn cum-tsn-ack))))
                                         q))
-                     new-buffered (reduce + (map #(if-let [p (:payload (:chunk %))] (alength ^bytes p) 0) new-q))
+                     new-buffered (reduce + (map #(b/blength (:payload (:chunk %))) new-q))
                      low-threshold (get state :buffered-amount-low-threshold 0)
                      evt (when (and (> old-buffered low-threshold) (<= new-buffered low-threshold))
                            {:type :on-buffered-amount-low :stream-id k})
@@ -319,7 +296,7 @@
         acked-bytes (:acked-bytes res)
         fast-retransmits (:fast-retransmits res)
         new-streams (:new-streams res)
-        new-total-buffered (reduce + (map (fn [[_ v]] (reduce + (map #(if-let [p (:payload (:chunk %))] (alength ^bytes p) 0) (:send-queue v)))) new-streams))
+        new-total-buffered (reduce + (map (fn [[_ v]] (reduce + (map #(b/blength (:payload (:chunk %))) (:send-queue v)))) new-streams))
         total-low-threshold (get state :total-buffered-amount-low-threshold 0)
         total-evt (when (and (> old-total-buffered total-low-threshold) (<= new-total-buffered total-low-threshold))
                     {:type :on-total-buffered-amount-low})
@@ -331,9 +308,7 @@
         ;; Congestion Control algorithm
         new-cwnd (if (> acked-bytes 0)
                    (if (<= cwnd ssthresh)
-                     ;; Slow Start
                      (+ cwnd (min acked-bytes mtu))
-                     ;; Congestion Avoidance
                      (let [partial (+ (get state :partial-bytes-acked 0) acked-bytes)]
                        (if (>= partial cwnd)
                          (+ cwnd mtu)
@@ -349,7 +324,7 @@
                       (get state :partial-bytes-acked 0))
 
         all-empty? (every? #(empty? (:send-queue (val %))) new-streams)
-        total-unacked (reduce + (map (fn [s] (reduce + (map #(+ 16 (if-let [p (:payload (:chunk %))] (alength ^bytes p) 0)) (:send-queue s)))) (vals new-streams)))
+        total-unacked (reduce + (map (fn [s] (reduce + (map #(+ 16 (b/blength (:payload (:chunk %)))) (:send-queue s)))) (vals new-streams)))
 
         s1 (-> state
                (assoc :streams new-streams)
@@ -411,7 +386,7 @@
   (let [new-cum-tsn (:new-cumulative-tsn chunk)
         remote-tsn (get state :remote-tsn -1)
         ooo-tsns (get state :out-of-order-tsns (sorted-set))
-        diff (unchecked-int (unchecked-subtract (unchecked-int new-cum-tsn) (unchecked-int remote-tsn)))
+        diff (b/s32-diff new-cum-tsn remote-tsn)
         is-newer? (or (= remote-tsn -1) (pos? diff))]
     (if-not is-newer?
       (let [sack-chunk {:type :sack
@@ -424,9 +399,8 @@
                          (update :timers dissoc :sctp/t-delayed-sack)
                          (assoc :unacked-data-chunks 0))
          :next-events []})
-      (let [;; Remove any out-of-order TSNs <= new-cum-tsn and advance through contiguous TSNs
-            pruned-ooo (into (sorted-set)
-                             (filter #(pos? (unchecked-int (unchecked-subtract (unchecked-int %) (unchecked-int new-cum-tsn))))
+      (let [pruned-ooo (into (sorted-set)
+                             (filter #(pos? (b/s32-diff % new-cum-tsn))
                                      ooo-tsns))
             s1 (loop [curr-tsn new-cum-tsn
                       curr-ooo pruned-ooo]
@@ -434,14 +408,13 @@
                    (if (contains? curr-ooo next-tsn)
                      (recur next-tsn (disj curr-ooo next-tsn))
                      (assoc state :remote-tsn curr-tsn :out-of-order-tsns curr-ooo))))
-            ;; Advance stream sequence numbers and prune abandoned chunks from receive queues
             s2 (reduce (fn [st {:keys [stream-id stream-sequence]}]
                          (let [cur-ssn (get-in st [:streams stream-id :next-ssn] 0)
                                target-ssn (bit-and (inc stream-sequence) 0xffff)
-                               ssn-diff (unchecked-short (unchecked-subtract (unchecked-short target-ssn) (unchecked-short cur-ssn)))
+                               ssn-diff (b/s16-diff target-ssn cur-ssn)
                                new-ssn (if (pos? ssn-diff) target-ssn cur-ssn)
                                recv-q (get-in st [:streams stream-id :recv-queue] [])
-                               new-recv-q (vec (filter #(pos? (unchecked-int (unchecked-subtract (unchecked-int (:tsn %)) (unchecked-int new-cum-tsn))))
+                               new-recv-q (vec (filter #(pos? (b/s32-diff (:tsn %) new-cum-tsn))
                                                        recv-q))]
                            (-> st
                                (assoc-in [:streams stream-id :next-ssn] new-ssn)

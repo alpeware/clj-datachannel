@@ -1,9 +1,9 @@
-(ns datachannel.packetize)
+(ns datachannel.packetize
+  "Cross-platform SCTP packetizer combining control chunks and stream data within MTU/cwnd/max-burst bounds."
+  (:require [datachannel.buffer :as b]))
 
 (defn- build-network-out [state bundled-chunks]
   (if (seq bundled-chunks)
-    ;; Special case: INIT-ACK routing dynamically targets the peer's init-tag without mutating global state.
-    ;; ABORT might also need this in the future if generated completely out of context.
     (let [first-chunk (first bundled-chunks)
           v-tag (if (and (= (:type first-chunk) :init-ack) (:dest-ver-tag first-chunk))
                   (:dest-ver-tag first-chunk)
@@ -51,8 +51,7 @@
             expired? (and max-lifetime (>= now-ms (+ (:sent-at data-item) max-lifetime)))]
         (if expired?
           ;; Drop this fragment (and any others in the same message) and send FORWARD-TSN
-          (let [;; Find all chunks belonging to the same user message
-                dropped-items (loop [items []
+          (let [dropped-items (loop [items []
                                      rem-q q]
                                 (if (empty? rem-q)
                                   items
@@ -63,24 +62,19 @@
                                       (recur (conj items it) (rest rem-q))))))
                 new-q (vec (drop (count dropped-items) q))
                 last-dropped-tsn (:tsn (last dropped-items))
-                abandoned-bytes (reduce + (map #(if (:sent? %) (+ 16 (if (:payload (:chunk %)) (alength ^bytes (:payload (:chunk %))) 0)) 0) dropped-items))
+                abandoned-bytes (reduce + (map #(if (:sent? %) (+ 16 (b/blength (:payload (:chunk %)))) 0) dropped-items))
                 new-flight-size (max 0 (- current-flight-size abandoned-bytes))
                 stream-id-to-fwd (get-in (first dropped-items) [:chunk :stream-id] stream-id)
                 seq-num-to-fwd (get-in (first dropped-items) [:chunk :seq-num] 0)
                 forward-tsn-chunk {:type :forward-tsn :new-cumulative-tsn last-dropped-tsn :streams [{:stream-id stream-id-to-fwd :stream-sequence seq-num-to-fwd}]}
                 new-streams (assoc-in current-streams [stream-id :send-queue] new-q)
-                ;; Insert FORWARD-TSN into pending-control-chunks
                 new-pending-ctrl (conj remaining-ctrl forward-tsn-chunk)
-
-                old-buffered (reduce + (map #(if-let [p (:payload (:chunk %))] (alength ^bytes p) 0) q))
-                new-buffered (reduce + (map #(if-let [p (:payload (:chunk %))] (alength ^bytes p) 0) new-q))
+                old-buffered (reduce + (map #(b/blength (:payload (:chunk %))) q))
+                new-buffered (reduce + (map #(b/blength (:payload (:chunk %))) new-q))
                 low-threshold (get state :buffered-amount-low-threshold 0)
                 new-app-events (if (and (> old-buffered low-threshold) (<= new-buffered low-threshold))
                                  (conj app-events {:type :on-buffered-amount-low :stream-id stream-id})
                                  app-events)]
-            ;; NOTE: we pass new-app-events somehow? No, process-stream-data doesn't return app-events if it recurs.
-            ;; Wait, `packetize-step` doesn't pass `new-app-events` through `recur`. Oh.
-            ;; Let's fix this properly. Oh wait, process-control-chunks also doesn't update app-events. Wait, `app-events` are not updated across recurs in `packetize-step`.
             {:action :recur
              :args [new-pending-ctrl
                     new-streams
@@ -88,7 +82,7 @@
                     current-size
                     new-flight-size
                     new-app-events]})
-          (let [chunk-size (+ 16 (if (:payload data-chunk) (alength ^bytes (:payload data-chunk)) 0))
+          (let [chunk-size (+ 16 (b/blength (:payload data-chunk)))
                 cwnd (get state :cwnd 1000000)]
             (if (and (> current-flight-size 0) (> (+ current-flight-size chunk-size) cwnd))
               ;; Congestion window full
@@ -137,10 +131,8 @@
         max-payload-size (- mtu 12)
         pending-ctrl (:pending-control-chunks state)
         streams (:streams state)]
-
     (if (and (empty? pending-ctrl) (every? empty? (map :send-queue (vals streams))))
       {:new-state state :network-out [] :app-events app-events}
-
       (loop [remaining-ctrl pending-ctrl
              current-streams streams
              bundled-chunks []

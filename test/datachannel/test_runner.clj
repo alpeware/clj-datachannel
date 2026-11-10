@@ -1,6 +1,7 @@
 (ns datachannel.test-runner
   (:require [clojure.test :refer [run-tests]]
             [datachannel.api-test]
+            [datachannel.cljc-sans-io-test]
             [datachannel.dtls-test]
             [datachannel.enforce-dtls-test]
             [datachannel.fuzz-test]
@@ -141,7 +142,8 @@
     'datachannel.sctp-set-max-message-size-test
     'datachannel.sctp-cannot-send-too-large-message-test
     'datachannel.fuzz-test
-    'datachannel.sctp-gen-test]])
+    'datachannel.sctp-gen-test
+    'datachannel.cljc-sans-io-test]])
 
 (defn -main "Executes the test suite in parallel groups, aggregates the failures, and exits with a status code representing total failures plus errors."
   [& _args]
