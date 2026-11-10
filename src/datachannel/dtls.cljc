@@ -240,6 +240,99 @@
        (js/Buffer.concat #js [hdr cert-der]))))
 
 #?(:cljs
+   (deftype NodeDtlsEngine [st-atom build-client-hello! reassemble-and-enqueue-hs! process-epoch1-record!]
+     IDtlsEngine
+     (begin-handshake! [_]
+       (swap! st-atom assoc :started? true))
+     (handshake-finished? [_]
+       (boolean (:finished? @st-atom)))
+     (peer-fingerprint [_]
+       (:peer-fingerprint @st-atom))
+     (handshake-step [_ in-bytes]
+       (let [raw (when in-bytes (b/to-bytes in-bytes))
+             buf (if (and raw (pos? (b/blength raw)))
+                   (js/Buffer.from raw)
+                   (js/Buffer.alloc 0))]
+         (if (and (zero? (.-length buf)) (not (:finished? @st-atom)))
+           (if (:client-mode? @st-atom)
+             (let [lf (:last-flight @st-atom)
+                   pkts (if (seq lf) lf [(build-client-hello!)])]
+               {:status :need-unwrap
+                :finished? false
+                :packets pkts
+                :app-data b/empty-bytes})
+             {:status :need-unwrap
+              :finished? false
+              :packets (vec (:last-flight @st-atom))
+              :app-data b/empty-bytes})
+           (let [out-packets-atom (atom [])
+                 app-chunks-atom (atom [])]
+             (loop [r-off 0]
+               (when (<= (+ r-off 13) (.-length buf))
+                 (let [ct (.readUInt8 buf r-off)
+                       r-ver (.readUInt16BE buf (+ r-off 1))
+                       _ (when-not (or (= r-ver 0xFEFD) (= r-ver 0xFEFF))
+                           (throw (ex-info "Unsupported peer DTLS record version"
+                                           {:type :dtls-unsupported-version :version r-ver})))
+                       ep (.readUInt16BE buf (+ r-off 3))
+                       r-len (.readUInt16BE buf (+ r-off 11))
+                       hdr (.subarray buf r-off (+ r-off 13))
+                       frag (.subarray buf (+ r-off 13) (+ r-off 13 r-len))]
+                   (cond
+                     (and (zero? ep) (= ct 22))
+                     (reassemble-and-enqueue-hs! frag out-packets-atom app-chunks-atom)
+
+                     (= ep 1)
+                     (process-epoch1-record! hdr frag out-packets-atom app-chunks-atom))
+                   (recur (+ r-off 13 r-len)))))
+             (let [fin? (boolean (:finished? @st-atom))
+                   app-chunks @app-chunks-atom
+                   app-bytes (if (seq app-chunks)
+                               (js/Uint8Array. (js/Buffer.concat (into-array app-chunks)))
+                               b/empty-bytes)]
+               {:status (if fin? :finished :need-unwrap)
+                :finished? fin?
+                :packets @out-packets-atom
+                :app-data app-bytes})))))
+     (wrap-app-data [_ plain-bytes]
+       (let [st @st-atom
+             w-key (if (:client-mode? st) (:client-write-key st) (:server-write-key st))
+             w-iv (if (:client-mode? st) (:client-write-iv st) (:server-write-iv st))
+             seq-n (:epoch1-seq st)
+             _ (swap! st-atom update :epoch1-seq inc)
+             plain-buf (js/Buffer.from (b/to-bytes plain-bytes))]
+         {:status :ok
+          :bytes (aead-encrypt-dtls-record w-key w-iv 1 seq-n 23 plain-buf)}))
+     (unwrap-packet [_ net-bytes]
+       (try
+         (let [st @st-atom
+               r-key (if (:client-mode? st) (:server-write-key st) (:client-write-key st))
+               r-iv (if (:client-mode? st) (:server-write-iv st) (:client-write-iv st))
+               buf (js/Buffer.from (b/to-bytes net-bytes))
+               chunks (transient [])]
+           (loop [off 0]
+             (when (<= (+ off 13) (.-length buf))
+               (let [ct (.readUInt8 buf off)
+                     r-ver (.readUInt16BE buf (+ off 1))
+                     _ (when (not= r-ver 0xFEFD)
+                         (throw (ex-info "Unsupported peer DTLS record version"
+                                         {:type :dtls-unsupported-version :version r-ver})))
+                     ep (.readUInt16BE buf (+ off 3))
+                     r-len (.readUInt16BE buf (+ off 11))
+                     hdr (.subarray buf off (+ off 13))
+                     frag (.subarray buf (+ off 13) (+ off 13 r-len))]
+                 (when (and (= ep 1) (= ct 23))
+                   (conj! chunks (aead-decrypt-dtls-record r-key r-iv hdr frag)))
+                 (recur (+ off 13 r-len)))))
+           (let [cs (persistent! chunks)]
+             {:status :ok
+              :bytes (if (seq cs)
+                       (js/Uint8Array. (js/Buffer.concat (into-array cs)))
+                       b/empty-bytes)}))
+         (catch :default _
+           {:status nil :bytes nil})))))
+
+#?(:cljs
    (defn- create-node-dtls-engine
      [cert-der priv-key client-mode?]
      (let [st-atom (atom {:client-mode? (boolean client-mode?)
@@ -401,7 +494,11 @@
                      (swap! out-packets-atom conj (build-client-hello!)))
 
                    2 ;; ServerHello
-                   (let [s-rand (js/Buffer.from (.subarray body 2 34))
+                   (let [sh-ver (.readUInt16BE body 0)
+                         _ (when (not= sh-ver 0xFEFD)
+                             (throw (ex-info "Unsupported peer DTLS ServerHello version"
+                                             {:type :dtls-unsupported-version :version sh-ver})))
+                         s-rand (js/Buffer.from (.subarray body 2 34))
                          sid-len (.readUInt8 body 34)
                          p0 (+ 35 sid-len 3)
                          ems? (loop [p (if (<= (+ p0 2) (.-length body)) (+ p0 2) (.-length body))
@@ -498,7 +595,11 @@
                  ;; Server mode
                  (case msg-type
                    1 ;; ClientHello
-                   (let [c-rand (js/Buffer.from (.subarray body 2 34))
+                   (let [ch-ver (.readUInt16BE body 0)
+                         _ (when (not= ch-ver 0xFEFD)
+                             (throw (ex-info "Unsupported peer DTLS ClientHello version"
+                                             {:type :dtls-unsupported-version :version ch-ver})))
+                         c-rand (js/Buffer.from (.subarray body 2 34))
                          sid-len (.readUInt8 body 34)
                          c-len (.readUInt8 body (+ 35 sid-len))
                          cookie (.subarray body (+ 36 sid-len) (+ 36 sid-len c-len))
@@ -652,88 +753,7 @@
                                 (assoc cur-entry :received new-rec)))))
                    (recur (+ off 12 frag-len)))))
              (drain-ordered-hs! out-packets-atom app-chunks-atom))]
-       (reify IDtlsEngine
-         (begin-handshake! [_]
-           (swap! st-atom assoc :started? true))
-         (handshake-finished? [_]
-           (boolean (:finished? @st-atom)))
-         (peer-fingerprint [_]
-           (:peer-fingerprint @st-atom))
-         (handshake-step [_ in-bytes]
-           (let [raw (when in-bytes (b/to-bytes in-bytes))
-                 buf (if (and raw (pos? (b/blength raw)))
-                       (js/Buffer.from raw)
-                       (js/Buffer.alloc 0))]
-             (if (and (zero? (.-length buf)) (not (:finished? @st-atom)))
-               (if (:client-mode? @st-atom)
-                 (let [lf (:last-flight @st-atom)
-                       pkts (if (seq lf) lf [(build-client-hello!)])]
-                   {:status :need-unwrap
-                    :finished? false
-                    :packets pkts
-                    :app-data b/empty-bytes})
-                 {:status :need-unwrap
-                  :finished? false
-                  :packets (vec (:last-flight @st-atom))
-                  :app-data b/empty-bytes})
-               (let [out-packets-atom (atom [])
-                     app-chunks-atom (atom [])]
-                 (loop [r-off 0]
-                   (when (<= (+ r-off 13) (.-length buf))
-                     (let [ct (.readUInt8 buf r-off)
-                           ep (.readUInt16BE buf (+ r-off 3))
-                           r-len (.readUInt16BE buf (+ r-off 11))
-                           hdr (.subarray buf r-off (+ r-off 13))
-                           frag (.subarray buf (+ r-off 13) (+ r-off 13 r-len))]
-                       (cond
-                         (and (zero? ep) (= ct 22))
-                         (reassemble-and-enqueue-hs! frag out-packets-atom app-chunks-atom)
-
-                         (= ep 1)
-                         (process-epoch1-record! hdr frag out-packets-atom app-chunks-atom))
-                       (recur (+ r-off 13 r-len)))))
-                 (let [fin? (boolean (:finished? @st-atom))
-                       app-chunks @app-chunks-atom
-                       app-bytes (if (seq app-chunks)
-                                   (js/Uint8Array. (js/Buffer.concat (into-array app-chunks)))
-                                   b/empty-bytes)]
-                   {:status (if fin? :finished :need-unwrap)
-                    :finished? fin?
-                    :packets @out-packets-atom
-                    :app-data app-bytes})))))
-         (wrap-app-data [_ plain-bytes]
-           (let [st @st-atom
-                 w-key (if (:client-mode? st) (:client-write-key st) (:server-write-key st))
-                 w-iv (if (:client-mode? st) (:client-write-iv st) (:server-write-iv st))
-                 seq-n (:epoch1-seq st)
-                 _ (swap! st-atom update :epoch1-seq inc)
-                 plain-buf (js/Buffer.from (b/to-bytes plain-bytes))]
-             {:status :ok
-              :bytes (aead-encrypt-dtls-record w-key w-iv 1 seq-n 23 plain-buf)}))
-         (unwrap-packet [_ net-bytes]
-           (try
-             (let [st @st-atom
-                   r-key (if (:client-mode? st) (:server-write-key st) (:client-write-key st))
-                   r-iv (if (:client-mode? st) (:server-write-iv st) (:client-write-iv st))
-                   buf (js/Buffer.from (b/to-bytes net-bytes))
-                   chunks (transient [])]
-               (loop [off 0]
-                 (when (<= (+ off 13) (.-length buf))
-                   (let [ct (.readUInt8 buf off)
-                         ep (.readUInt16BE buf (+ off 3))
-                         r-len (.readUInt16BE buf (+ off 11))
-                         hdr (.subarray buf off (+ off 13))
-                         frag (.subarray buf (+ off 13) (+ off 13 r-len))]
-                     (when (and (= ep 1) (= ct 23))
-                       (conj! chunks (aead-decrypt-dtls-record r-key r-iv hdr frag)))
-                     (recur (+ off 13 r-len)))))
-               (let [cs (persistent! chunks)]
-                 {:status :ok
-                  :bytes (if (seq cs)
-                           (js/Uint8Array. (js/Buffer.concat (into-array cs)))
-                           b/empty-bytes)}))
-             (catch :default _
-               {:status nil :bytes nil})))))))
+       (NodeDtlsEngine. st-atom build-client-hello! reassemble-and-enqueue-hs! process-epoch1-record!))))
 
 ;; =============================================================================
 ;; 3. Public Certificate, Context, and Engine Constructors

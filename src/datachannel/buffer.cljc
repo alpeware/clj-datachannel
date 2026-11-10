@@ -448,7 +448,8 @@
   (satisfies? IBinaryBuffer x))
 
 (defn to-bytes
-  "Coerces a byte array or `IBinaryBuffer` to a native byte array."
+  "Coerces a byte array or `IBinaryBuffer` to a native byte array.
+   Note: returns `nil` for non-buffer inputs such as Strings; use `utf8->bytes` for String encoding."
   [buf-or-bytes]
   (cond
     (nil? buf-or-bytes) nil
@@ -584,10 +585,10 @@
                (js/Uint8Array. (.digest hash))))))
 
 (defn hmac-sha1
-  "Computes 20-byte HMAC-SHA1 over `data-bytes` with `key-bytes-or-str`."
-  [key-bytes-or-str data-bytes]
+  "Computes 20-byte HMAC-SHA1 over `data-bytes-or-str` with `key-bytes-or-str`."
+  [key-bytes-or-str data-bytes-or-str]
   (let [k-bytes (if (string? key-bytes-or-str) (utf8->bytes key-bytes-or-str) (to-bytes key-bytes-or-str))
-        d-bytes (to-bytes data-bytes)]
+        d-bytes (if (string? data-bytes-or-str) (utf8->bytes data-bytes-or-str) (to-bytes data-bytes-or-str))]
     #?(:clj (let [mac (Mac/getInstance "HmacSHA1")
                   key-spec (SecretKeySpec. ^bytes k-bytes "HmacSHA1")]
               (.init mac key-spec)
@@ -597,10 +598,10 @@
                (js/Uint8Array. (.digest hmac))))))
 
 (defn hmac-sha256
-  "Computes 32-byte HMAC-SHA256 over `data-bytes` with `key-bytes-or-str`."
-  [key-bytes-or-str data-bytes]
+  "Computes 32-byte HMAC-SHA256 over `data-bytes-or-str` with `key-bytes-or-str`."
+  [key-bytes-or-str data-bytes-or-str]
   (let [k-bytes (if (string? key-bytes-or-str) (utf8->bytes key-bytes-or-str) (to-bytes key-bytes-or-str))
-        d-bytes (to-bytes data-bytes)]
+        d-bytes (if (string? data-bytes-or-str) (utf8->bytes data-bytes-or-str) (to-bytes data-bytes-or-str))]
     #?(:clj (let [mac (Mac/getInstance "HmacSHA256")
                   key-spec (SecretKeySpec. ^bytes k-bytes "HmacSHA256")]
               (.init mac key-spec)
