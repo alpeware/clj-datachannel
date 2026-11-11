@@ -196,9 +196,43 @@
      (* (b/bget-u8 pkt-bytes (+ offset 2)) 256)
      (b/bget-u8 pkt-bytes (+ offset 3))))
 
+(defn- decode-rrs
+  [pkt-bytes total count start-offset]
+  (loop [idx 0
+         off start-offset
+         rrs []]
+    (if (< idx count)
+      (when-let [{:keys [name next-offset]} (decode-qname pkt-bytes off)]
+        (when (<= (+ next-offset 10) total)
+          (let [rtype (read-u16-be pkt-bytes next-offset)
+                raw-rclass (read-u16-be pkt-bytes (+ next-offset 2))
+                flush? (pos? (bit-and raw-rclass 0x8000))
+                rclass (bit-and raw-rclass 0x7fff)
+                ttl (read-u32-be pkt-bytes (+ next-offset 4))
+                rdlength (read-u16-be pkt-bytes (+ next-offset 8))
+                rdata-start (+ next-offset 10)
+                rdata-end (+ rdata-start rdlength)]
+            (when (<= rdata-end total)
+              (let [rdata (b/bslice pkt-bytes rdata-start rdata-end)
+                    ip-str (when (and (= rtype qtype-a) (= rdlength 4))
+                             (format-ipv4-octets [(b/bget-u8 rdata 0)
+                                                  (b/bget-u8 rdata 1)
+                                                  (b/bget-u8 rdata 2)
+                                                  (b/bget-u8 rdata 3)]))]
+                (recur (inc idx)
+                       rdata-end
+                       (conj rrs (cond-> {:name name
+                                          :type rtype
+                                          :class rclass
+                                          :cache-flush? flush?
+                                          :ttl ttl
+                                          :rdata rdata}
+                                   ip-str (assoc :ip ip-str)))))))))
+      {:rrs rrs :offset off})))
+
 (defn decode-mdns-packet
   "Purely decodes an RFC 6762 mDNS packet (`byte[]` / `Uint8Array`) into
-   `{:id <int> :qr? <bool> :aa? <bool> :questions [...] :answers [...]}` or `nil` on malformed bytes."
+   `{:id <int> :flags <int> :qr? <bool> :aa? <bool> :questions [...] :answers [...] :authorities [...] :additionals [...]}` or `nil` on malformed bytes."
   [pkt-bytes]
   (when (and pkt-bytes (>= (b/blength pkt-bytes) 12))
     (let [total (b/blength pkt-bytes)
@@ -207,8 +241,10 @@
           qr? (pos? (bit-and flags 0x8000))
           aa? (pos? (bit-and flags 0x0400))
           qdcount (read-u16-be pkt-bytes 4)
-          ancount (read-u16-be pkt-bytes 6)]
-      (when (and (<= qdcount 64) (<= ancount 64))
+          ancount (read-u16-be pkt-bytes 6)
+          nscount (read-u16-be pkt-bytes 8)
+          arcount (read-u16-be pkt-bytes 10)]
+      (when (and (<= qdcount 64) (<= ancount 64) (<= nscount 64) (<= arcount 64))
         (loop [q-idx 0
                offset 12
                questions []]
@@ -225,41 +261,17 @@
                                           :qtype qtype
                                           :qclass qclass
                                           :unicast-response? unicast?})))))
-            (loop [a-idx 0
-                   a-off offset
-                   answers []]
-              (if (< a-idx ancount)
-                (when-let [{:keys [name next-offset]} (decode-qname pkt-bytes a-off)]
-                  (when (<= (+ next-offset 10) total)
-                    (let [rtype (read-u16-be pkt-bytes next-offset)
-                          raw-rclass (read-u16-be pkt-bytes (+ next-offset 2))
-                          flush? (pos? (bit-and raw-rclass 0x8000))
-                          rclass (bit-and raw-rclass 0x7fff)
-                          ttl (read-u32-be pkt-bytes (+ next-offset 4))
-                          rdlength (read-u16-be pkt-bytes (+ next-offset 8))
-                          rdata-start (+ next-offset 10)
-                          rdata-end (+ rdata-start rdlength)]
-                      (when (<= rdata-end total)
-                        (let [rdata (b/bslice pkt-bytes rdata-start rdata-end)
-                              ip-str (when (and (= rtype qtype-a) (= rdlength 4))
-                                       (format-ipv4-octets [(b/bget-u8 rdata 0)
-                                                            (b/bget-u8 rdata 1)
-                                                            (b/bget-u8 rdata 2)
-                                                            (b/bget-u8 rdata 3)]))]
-                          (recur (inc a-idx)
-                                 rdata-end
-                                 (conj answers (cond-> {:name name
-                                                        :type rtype
-                                                        :class rclass
-                                                        :cache-flush? flush?
-                                                        :ttl ttl
-                                                        :rdata rdata}
-                                                 ip-str (assoc :ip ip-str)))))))))
-                {:id id
-                 :qr? qr?
-                 :aa? aa?
-                 :questions questions
-                 :answers answers}))))))))
+            (when-let [{answers :rrs a-off :offset} (decode-rrs pkt-bytes total ancount offset)]
+              (when-let [{authorities :rrs ns-off :offset} (decode-rrs pkt-bytes total nscount a-off)]
+                (when-let [{additionals :rrs} (decode-rrs pkt-bytes total arcount ns-off)]
+                  {:id id
+                   :flags flags
+                   :qr? qr?
+                   :aa? aa?
+                   :questions questions
+                   :answers answers
+                   :authorities authorities
+                   :additionals additionals})))))))))
 
 ;; =============================================================================
 ;; Pure Sans-IO mDNS Responder & Cache State Machine
@@ -303,11 +315,11 @@
   ([table pkt-bytes now-ms]
    (if-let [parsed (decode-mdns-packet pkt-bytes)]
      (if (:qr? parsed)
-       ;; Inbound mDNS response: cache valid `.local` A records
+       ;; Inbound mDNS response: cache valid `.local` A records (both answers and additionals)
        (let [a-records (filter #(and (= (:type %) qtype-a)
                                      (string? (:ip %))
                                      (mdns-hostname? (:name %)))
-                               (:answers parsed))
+                               (concat (:answers parsed) (:additionals parsed)))
              [new-table resolved]
              (reduce (fn [[t acc] ans]
                        (let [h (normalize-mdns-hostname (:name ans))

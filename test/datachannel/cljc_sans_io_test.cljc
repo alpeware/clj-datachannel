@@ -642,4 +642,71 @@
             bad-step (mdns/handle-mdns-packet empty-tab (b/bytes-from-seq [1 2 3]) 1000)]
         (is (mdns/mdns-hostname? gen-host))
         (is (nil? (mdns/decode-mdns-packet (b/bytes-from-seq [1 2 3]))))
-        (is (= 1 (get-in bad-step [:state :diagnostics :ignored-malformed])))))))
+        (is (= 1 (get-in bad-step [:state :diagnostics :ignored-malformed]))))))
+
+  (testing "decode-mdns-packet decodes authorities (NSCOUNT) and additionals (ARCOUNT) and handle-mdns-packet caches additionals A records"
+    (let [ans-name "host-ans.local"
+          auth-name "host-auth.local"
+          add-name "host-add.local"
+          ans-qname (mdns/encode-qname ans-name)
+          auth-qname (mdns/encode-qname auth-name)
+          add-qname (mdns/encode-qname add-name)
+          total-len (+ 12
+                       (b/blength ans-qname) 10 4
+                       (b/blength auth-qname) 10 2
+                       (b/blength add-qname) 10 4)
+          buf (b/allocate-buffer total-len)]
+      ;; Header: ID=42, Flags=0x8400 (QR=1, AA=1), QD=0, AN=1, NS=1, AR=1
+      (b/buf-put-u16! buf 42)
+      (b/buf-put-u16! buf 0x8400)
+      (b/buf-put-u16! buf 0)
+      (b/buf-put-u16! buf 1)
+      (b/buf-put-u16! buf 1)
+      (b/buf-put-u16! buf 1)
+      ;; Answer: host-ans.local A 10.0.0.1
+      (b/buf-put-bytes! buf ans-qname)
+      (b/buf-put-u16! buf 1)
+      (b/buf-put-u16! buf 1)
+      (b/buf-put-u32! buf 120)
+      (b/buf-put-u16! buf 4)
+      (doseq [o [10 0 0 1]] (b/buf-put-u8! buf o))
+      ;; Authority: host-auth.local NS [0 1]
+      (b/buf-put-bytes! buf auth-qname)
+      (b/buf-put-u16! buf 2)
+      (b/buf-put-u16! buf 1)
+      (b/buf-put-u32! buf 300)
+      (b/buf-put-u16! buf 2)
+      (doseq [o [0 1]] (b/buf-put-u8! buf o))
+      ;; Additional: host-add.local A 10.0.0.2 (glue record)
+      (b/buf-put-bytes! buf add-qname)
+      (b/buf-put-u16! buf 1)
+      (b/buf-put-u16! buf 1)
+      (b/buf-put-u32! buf 60)
+      (b/buf-put-u16! buf 4)
+      (doseq [o [10 0 0 2]] (b/buf-put-u8! buf o))
+      (b/buf-flip! buf)
+      (let [pkt (b/buf->bytes buf)
+            decoded (mdns/decode-mdns-packet pkt)]
+        (is (some? decoded))
+        (is (= 42 (:id decoded)))
+        (is (= 0x8400 (:flags decoded)))
+        (is (true? (:qr? decoded)))
+        (is (true? (:aa? decoded)))
+        (is (= 1 (count (:answers decoded))))
+        (is (= "host-ans.local" (:name (first (:answers decoded)))))
+        (is (= "10.0.0.1" (:ip (first (:answers decoded)))))
+        (is (= 1 (count (:authorities decoded))))
+        (is (= "host-auth.local" (:name (first (:authorities decoded)))))
+        (is (= 2 (:type (first (:authorities decoded)))))
+        (is (= 1 (count (:additionals decoded))))
+        (is (= "host-add.local" (:name (first (:additionals decoded)))))
+        (is (= "10.0.0.2" (:ip (first (:additionals decoded)))))
+        ;; State machine handling: verifies Additional A record is cached alongside Answer
+        (let [tab (mdns/init-mdns-table)
+              res (mdns/handle-mdns-packet tab pkt 5000)]
+          (is (= 2 (get-in res [:state :diagnostics :answers-cached])))
+          (is (= "10.0.0.1" (mdns/lookup-cached-ip (:state res) "host-ans.local" 5000)))
+          (is (= "10.0.0.2" (mdns/lookup-cached-ip (:state res) "host-add.local" 5000)))
+          (is (= {"host-ans.local" "10.0.0.1"
+                  "host-add.local" "10.0.0.2"}
+                 (:resolved res))))))))
