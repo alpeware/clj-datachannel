@@ -93,7 +93,6 @@
   (let [opt-buf (first opt-args)
         new-state (:new-state result-map)
         zero-checksum? (get-in new-state [:metrics :uses-zero-checksum])
-        engine (:dtls/engine new-state)
         tc (:turn-client new-state)
         use-turn? (and (or (:use-turn-relay? new-state)
                            (:last-rx-via-turn? new-state))
@@ -102,29 +101,38 @@
         turn-srv (when tc
                    (handlers/resolve-candidate-target
                     (or (:turn-server-addr new-state) (:server-addr tc))))
-        encoded (mapv (fn [item]
-                        (cond
-                          (and (map? item) (:packet item)) ; Targeted packet map
-                          item
-                          (map? item) ; SCTP packet
-                          (let [buf (or opt-buf (b/allocate-buffer buffer-size))]
-                            (b/buf-clear! buf)
-                            (sctp/encode-packet item buf {:zero-checksum? zero-checksum?})
-                            (b/buf-flip! buf)
-                            (if (and engine (dtls/handshake-finished? engine))
-                              (let [{:keys [bytes]} (dtls/wrap-app-data engine (b/to-bytes buf))]
-                                (b/wrap-buffer bytes))
-                              buf))
-                          (b/binary-buffer? item) ; Already encoded (STUN/DTLS)
-                          item
-                          (b/byte-array? item) ; byte-array
-                          (b/wrap-buffer item)
-                          :else
-                          (throw (ex-info "Unknown item type in network-out" {:item item}))))
-                      (:network-out result-map []))
+        [encoded updated-state]
+        (reduce (fn [[out-acc st] item]
+                  (let [eng (:dtls/engine st)]
+                    (cond
+                      (and (map? item) (:packet item)) ; Targeted packet map
+                      [(conj out-acc item) st]
+
+                      (map? item) ; SCTP packet
+                      (let [buf (or opt-buf (b/allocate-buffer buffer-size))]
+                        (b/buf-clear! buf)
+                        (sctp/encode-packet item buf {:zero-checksum? zero-checksum?})
+                        (b/buf-flip! buf)
+                        (if (and eng (dtls/handshake-finished? eng))
+                          (let [wrap-res (dtls/wrap-app-data eng (b/to-bytes buf))
+                                new-eng (or (:engine wrap-res) eng)]
+                            [(conj out-acc (b/wrap-buffer (:bytes wrap-res)))
+                             (assoc st :dtls/engine new-eng)])
+                          [(conj out-acc buf) st]))
+
+                      (b/binary-buffer? item) ; Already encoded (STUN/DTLS)
+                      [(conj out-acc item) st]
+
+                      (b/byte-array? item) ; byte-array
+                      [(conj out-acc (b/wrap-buffer item)) st]
+
+                      :else
+                      (throw (ex-info "Unknown item type in network-out" {:item item})))))
+                [[] new-state]
+                (:network-out result-map []))
         [final-out final-state final-events]
         (if-not use-turn?
-          [encoded new-state (vec (:app-events result-map []))]
+          [encoded updated-state (vec (:app-events result-map []))]
           (reduce (fn [[out-acc st-acc evts-acc] item]
                     (let [pkt (if (and (map? item) (:packet item)) (:packet item) item)
                           target (when (map? item) (handlers/resolve-candidate-target (:target item)))]
@@ -152,7 +160,7 @@
                                                  (assoc-in [:turn-client :last-error] :missing-peer-address))
                                   drop-evt {:type :turn-drop :reason :missing-peer-address :peer-address peer-addr}]
                               [out-acc st-dropped (conj evts-acc drop-evt)]))))))
-                  [[] new-state (vec (:app-events result-map []))]
+                  [[] updated-state (vec (:app-events result-map []))]
                   encoded))]
     (assoc result-map
            :new-state final-state
@@ -215,11 +223,12 @@
 
 (defn handle-receive
   "Primary entry point for multiplexing inbound UDP data, distinguishing STUN, DTLS, and SCTP bytes based on their first byte, running decryption or packet routing."
-  [state network-bytes now-ms & [remote-addr]]
+  [orig-state network-bytes now-ms & [remote-addr]]
   (let [len (b/blength network-bytes)]
     (if (zero? len)
-      {:new-state state :network-out [] :app-events []}
-      (let [first-byte (b/bget-u8 network-bytes 0)
+      {:new-state orig-state :network-out [] :app-events []}
+      (let [state (assoc orig-state :last-now-ms now-ms)
+            first-byte (b/bget-u8 network-bytes 0)
             engine (:dtls/engine state)]
         (cond
           ;; ChannelData (first byte 64..127)
@@ -339,7 +348,10 @@
                      (:dtls-verified? state))
               ;; Application data
               (try
-                (let [{:keys [bytes]} (dtls/unwrap-packet engine network-bytes)]
+                (let [unwrap-res (dtls/unwrap-packet engine network-bytes)
+                      engine' (or (:engine unwrap-res) engine)
+                      state (assoc state :dtls/engine engine')
+                      {:keys [bytes]} unwrap-res]
                   (if (and bytes (pos? (b/blength bytes)))
                     (let [state (assoc state :last-stun-received now-ms :last-any-traffic now-ms)
                           sctp-buf (b/wrap-buffer bytes)
@@ -352,11 +364,14 @@
                   {:new-state state :network-out [] :app-events []}))
               ;; Handshake
               (try
-                (let [{:keys [finished? packets app-data]} (dtls/handshake-step engine network-bytes)]
+                (let [step-res (dtls/handshake-step engine network-bytes)
+                      engine' (or (:engine step-res) engine)
+                      state (assoc state :dtls/engine engine')
+                      {:keys [finished? packets app-data]} step-res]
                   (if (and finished?
                            (not (:dtls-verified? state)))
                     (if (and (:remote-fingerprint state)
-                             (not (dtls/verify-peer-fingerprint engine (:remote-fingerprint state))))
+                             (not (dtls/verify-peer-fingerprint engine' (:remote-fingerprint state))))
                       (let [state-closed (assoc state :state :closed)
                             abort-chunk {:type :abort
                                          :flags 0
@@ -403,7 +418,6 @@
                             {:new-state state :network-out (vec packets) :app-events [{:type :dtls-handshake-progress}]}))
                         {:new-state state :network-out (vec packets) :app-events [{:type :dtls-handshake-progress}]}))))
                 (catch #?(:clj Exception :cljs :default) e
-                  (println "DTLS HANDSHAKE EXCEPTION" (ex-message e))
                   (let [err-msg (or (ex-message e) "DTLS Fingerprint Mismatch")]
                     {:new-state (assoc state :state :closed)
                      :network-out []
@@ -411,21 +425,43 @@
 
           ;; SCTP (Default, raw)
           :else
-          {:new-state state :network-out [] :app-events []})))))
+          {:new-state orig-state :network-out [] :app-events []})))))
 
 (defn create-connection
   "Initializes the flattened SCTP/ICE/DTLS pure state map with configured congestion parameters and cryptography contexts."
   [options client-mode?]
-  (let [now-ms (b/now-ms)
-        cert-data (or (:cert-data options) (dtls/generate-cert))
+  (let [now-ms (long (or (:now-ms options) (b/now-ms)))
+        rng (or (:rng options) (when-let [s (:seed options)] (b/make-rng s)))
+        cert-data (or (:cert-data options)
+                      (when (:simulated-dtls? options)
+                        (dtls/generate-simulated-cert rng))
+                      (dtls/generate-cert))
         engine (or (:dtls/engine options)
                    (:dtls-engine options)
+                   (when (:simulated-dtls? options)
+                     (dtls/create-simulated-engine (assoc options
+                                                          :client-mode? client-mode?
+                                                          :client? client-mode?
+                                                          :cert cert-data
+                                                          :rng (when rng (b/fork-rng rng :dtls)))))
                    (when (and (:cert cert-data) (:key cert-data))
                      (let [ctx (dtls/create-ssl-context (:cert cert-data) (:key cert-data))]
                        (dtls/create-engine ctx client-mode?))))
-        local-ver-tag (or (:local-ver-tag options) (b/random-int 2147483647))
-        cookie-secret (or (:cookie-secret options) (b/random-bytes 32))]
-    {:cookie-secret cookie-secret
+        local-ver-tag (or (:local-ver-tag options)
+                          (if rng
+                            (inc (b/random-int 2147483646 rng))
+                            (b/random-int 2147483647)))
+        cookie-secret (or (:cookie-secret options)
+                          (if rng
+                            (b/random-bytes 32 rng)
+                            (b/random-bytes 32)))
+        ice-tie-breaker (or (:ice-tie-breaker options)
+                            (if rng
+                              (b/random-u64 rng)
+                              (b/random-u64)))]
+    {:rng rng
+     :last-now-ms now-ms
+     :cookie-secret cookie-secret
      :remote-ver-tag 0
      :local-ver-tag local-ver-tag
      :last-stun-received now-ms
@@ -440,7 +476,7 @@
      :rto-initial (get options :rto-initial 1000)
      :max-retransmissions (get options :max-retransmissions 10)
      :mtu (get options :mtu 1200)
-     :streams {}
+     :streams (sorted-map)
      :pending-control-chunks []
      :metrics {:tx-packets 0
                :rx-packets 0
@@ -466,14 +502,15 @@
      :remote-fingerprint (:remote-fingerprint options)
      :ice-lite? (boolean (:ice-lite? options))
      :ice-role (or (:ice-role options) (if client-mode? :controlling :controlled))
-     :ice-tie-breaker (or (:ice-tie-breaker options) (b/random-u64))
+     :ice-tie-breaker ice-tie-breaker
      :nominated-pair nil
      :nominated? false
      :nomination-policy (or (:nomination-policy options) :aggressive)
      :nominate-on-next-check? false
      :local-priority (or (:local-priority options)
                          (sdp/compute-candidate-priority (or (:candidate-type options) :host) 65535 1))
-     :turn-client (when-let [tc (:turn-config options)] (turn/init-turn-client tc))
+     :turn-client (when-let [tc (:turn-config options)]
+                    (turn/init-turn-client (cond-> tc rng (assoc :rng (b/fork-rng rng :turn)))))
      :turn-server-addr (when-let [tc (:turn-config options)]
                          (handlers/resolve-candidate-target
                           (or (:server-addr tc)
@@ -491,7 +528,8 @@
      :seen-candidates #{}
      :local-candidates []
      :remote-candidates (or (:remote-candidates options) [])
-     :data-channels {}
+     :data-channels (sorted-map)
+     :channels (sorted-map)
      :client-mode? client-mode?
      :local-outbound-streams (get options :local-outbound-streams 65535)
      :local-inbound-streams (get options :local-inbound-streams 65535)
@@ -541,7 +579,7 @@
                       :max-retransmits (:max-retransmits opts)
                       :max-packet-life-time (:max-packet-life-time opts)}
             payload (dcep/encode-message open-msg)
-            now-ms (b/now-ms)
+            now-ms (long (or (:now-ms options) (:last-now-ms state) (b/now-ms)))
             res (send-data new-state payload id :webrtc/dcep now-ms)]
         (assoc res :channel-id id)))))
 

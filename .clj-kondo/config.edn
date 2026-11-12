@@ -1,4 +1,7 @@
 {:linters {:unresolved-symbol {:exclude [datachannel.chaos-fuzz-test/test-chaos-connection-establishment
+                                       datachannel.determinism-test/prop-splitmix64-seed-reproducibility
+                                       datachannel.determinism-test/prop-splitmix64-snapshot-restore
+                                       datachannel.determinism-test/prop-splitmix64-fork-isolation
                                        datachannel.fuzz-test/fuzz-handle-receive-no-crashes
                                        datachannel.sctp-gen-test/test-sctp-state-machine-invariants
                                        datachannel.tcp-test/test-rfc4571-framing-roundtrip-arbitrary-chunks
@@ -15,7 +18,10 @@
                                        prop-parse-proxy-url-invariants
                                        prop-build-and-parse-connect-roundtrip
                                        prop-parse-connect-response-errors
-                                       prop-parse-connect-response-incomplete]}
+                                       prop-parse-connect-response-incomplete
+                                       prop-splitmix64-seed-reproducibility
+                                       prop-splitmix64-snapshot-restore
+                                       prop-splitmix64-fork-isolation]}
            :large-def {:level :warning :row-threshold 60}
            :too-many-params {:level :warning :max-params 5}
            :missing-docstring {:level :warning}

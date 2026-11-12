@@ -225,6 +225,7 @@
         stun-opts {:role (or (:ice-role state) (if (:client-mode? state) :controlling :controlled))
                    :tie-breaker (:ice-tie-breaker state)
                    :priority (:local-priority state)
+                   :rng (:rng state)
                    :use-candidate? (and (= (or (:ice-role state) (if (:client-mode? state) :controlling :controlled)) :controlling)
                                         (or (= (:nomination-policy state :aggressive) :aggressive)
                                             (boolean (:nominate-on-next-check? state))))}
@@ -252,7 +253,7 @@
     (let [turn-srv (or (:turn-server-addr state) (:server-addr tc))
           res (cond
                 (= (:state tc) :idle)
-                (turn/start-allocation tc)
+                (turn/start-allocation tc {:now-ms now-ms})
 
                 (#{:allocated :channel-bound} (:state tc))
                 (turn/check-turn-expiry tc now-ms)
@@ -285,9 +286,12 @@
       {:new-state (update state :timers dissoc :dtls/flight-timeout)
        :network-out []
        :app-events []}
-      (let [{:keys [packets]} (dtls/handshake-step engine b/empty-bytes)]
-        {:new-state (assoc-in state [:timers :dtls/flight-timeout] {:expires-at (+ now-ms 1000)})
-         :network-out (vec packets)
+      (let [res (dtls/handshake-step engine b/empty-bytes)
+            state-with-eng (if-let [upd (:engine res)]
+                             (assoc state :dtls/engine upd)
+                             state)]
+        {:new-state (assoc-in state-with-eng [:timers :dtls/flight-timeout] {:expires-at (+ now-ms 1000)})
+         :network-out (vec (:packets res))
          :app-events []}))
     {:new-state (update state :timers dissoc :dtls/flight-timeout)
      :network-out []
@@ -299,7 +303,8 @@
 (defn handle-timeout
   "Routes timer expiries to `handle-timeout-timer` and feeds the resulting state transitions through the `packetize` network generation pipeline."
   [state timer-id now-ms & [_engine]]
-  (let [res (handle-timeout-timer state timer-id now-ms)]
+  (let [st (assoc state :last-now-ms now-ms)
+        res (handle-timeout-timer st timer-id now-ms)]
     (if (or (seq (:pending-control-chunks (:new-state res)))
             (= "sctp" (namespace timer-id)))
       (packetize/packetize (:new-state res) (:app-events res) now-ms)
@@ -374,6 +379,7 @@
         stun-opts {:role (or (:ice-role st1) :controlling)
                    :tie-breaker (:ice-tie-breaker st1)
                    :priority (:local-priority st1)
+                   :rng (:rng st1)
                    :use-candidate? true}
         network-out (if (and target (:remote-ice-ufrag st1) (:remote-ice-pwd st1))
                       [{:packet (stun/make-binding-request (:ice-ufrag st1) (:remote-ice-ufrag st1) (:remote-ice-pwd st1) stun-opts)

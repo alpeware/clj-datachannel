@@ -165,41 +165,212 @@
   #?(:clj (.encodeToString (Base64/getEncoder) ^bytes bs)
      :cljs (b64/encodeByteArray bs)))
 
+;; =============================================================================
+;; 2a. Deterministic SplitMix64 PRNG & State Protocols
+;; =============================================================================
+
+(defprotocol IDeterministicRng
+  "Deterministic pseudo-random number generator protocol supporting state snapshotting and multiverse forking."
+  (next-u64 [rng] "Draws next 64-bit integer and advances state.")
+  (next-u32 [rng] "Draws next unsigned 32-bit integer [0, 4294967295] and advances state.")
+  (next-bytes [rng n] "Draws `n` bytes into a native byte array and advances state.")
+  (rng-state [rng] "Returns the current 64-bit state without advancing state.")
+  (fork-rng [rng branch-id] "Forks an independent deterministic RNG seeded from current state and branch-id."))
+
+#?(:clj
+   (do
+     (def ^:private ^:const SPLITMIX_GAMMA (long -7046029254386353131))
+     (def ^:private ^:const SPLITMIX_MIX1  (long -4658895280553007687))
+     (def ^:private ^:const SPLITMIX_MIX2  (long -7723592293110705685))
+
+     (defn- mix64-step
+       ^long [^long z]
+       (let [z1 (unchecked-multiply (bit-xor z (unsigned-bit-shift-right z 30)) SPLITMIX_MIX1)
+             z2 (unchecked-multiply (bit-xor z1 (unsigned-bit-shift-right z1 27)) SPLITMIX_MIX2)]
+         (bit-xor z2 (unsigned-bit-shift-right z2 31))))
+
+     (defn- branch-id->long [branch-id]
+       (cond
+         (nil? branch-id) (long 0)
+         (number? branch-id) (long branch-id)
+         (keyword? branch-id) (branch-id->long (name branch-id))
+         (string? branch-id)
+         (let [bs (utf8->bytes branch-id)
+               len (blength bs)]
+           (loop [i 0
+                  h (long -3750763034362895579)]
+             (if (= i len)
+               h
+               (let [b (bget-u8 bs i)]
+                 (recur (inc i)
+                        (unchecked-multiply (bit-xor h b) 1099511628211))))))
+         :else (long (hash branch-id))))))
+
+#?(:cljs
+   (do
+     (defn- branch-id->bi [branch-id]
+       (cond
+         (nil? branch-id) (js/BigInt 0)
+         (js* "typeof ~{} === 'bigint'" branch-id) branch-id
+         (number? branch-id) (js/BigInt (str (long branch-id)))
+         (keyword? branch-id) (branch-id->bi (name branch-id))
+         (string? branch-id)
+         (let [bs (utf8->bytes branch-id)
+               len (blength bs)]
+           (loop [i 0
+                  h (js/BigInt "14695981039346656037")]
+             (if (= i len)
+               (js* "~{} & 18446744073709551615n" h)
+               (let [b (js/BigInt (bget-u8 bs i))]
+                 (recur (inc i)
+                        (js* "((~{} ^ ~{}) * 1099511628211n) & 18446744073709551615n" h b))))))
+         :else (js/BigInt (str (hash branch-id)))))
+
+     (defn- mix64-bi [z]
+       (let [u (js/BigInt.asUintN 64 z)
+             z1 (js* "((~{} ^ (~{} >> 30n)) * 13787848793156543929n) & 18446744073709551615n" u u)
+             z2 (js* "((~{} ^ (~{} >> 27n)) * 10723151780598845931n) & 18446744073709551615n" z1 z1)
+             z3 (js* "(~{} ^ (~{} >> 31n)) & 18446744073709551615n" z2 z2)]
+         z3))))
+
+(deftype SplitMix64 [state-atom]
+  IDeterministicRng
+  (next-u64 [_]
+    #?(:clj
+       (let [s (swap! state-atom (fn [^long s] (unchecked-add s SPLITMIX_GAMMA)))]
+         (mix64-step s))
+       :cljs
+       (let [s (swap! state-atom
+                      (fn [s]
+                        (let [cur (if (js* "typeof ~{} === 'bigint'" s) s (js/BigInt (str (or s 0))))]
+                          (js/BigInt.asIntN 64 (js* "(~{} + 11400714819323198485n) & 18446744073709551615n" cur)))))
+             u64 (mix64-bi s)]
+         (js/BigInt.asIntN 64 u64))))
+
+  (next-u32 [this]
+    #?(:clj
+       (unsigned-bit-shift-right (next-u64 this) 32)
+       :cljs
+       (let [w (next-u64 this)
+             u64 (js/BigInt.asUintN 64 w)]
+         (js/Number (js* "(~{} >> 32n) & 0xFFFFFFFFn" u64)))))
+
+  (next-bytes [this n]
+    (let [out (alloc-bytes n)]
+      (loop [offset 0]
+        (if (>= offset n)
+          out
+          (let [w (next-u64 this)
+                rem (- n offset)
+                chunk (min 8 rem)]
+            #?(:clj
+               (dotimes [i chunk]
+                 (let [shift (* 8 (- 7 i))
+                       b (bit-and (unsigned-bit-shift-right w shift) 0xFF)]
+                   (bset-u8! out (+ offset i) b)))
+               :cljs
+               (let [u64 (js/BigInt.asUintN 64 w)]
+                 (dotimes [i chunk]
+                   (let [shift (js/BigInt (* 8 (- 7 i)))
+                         b (js/Number (js* "(~{} >> ~{}) & 0xFFn" u64 shift))]
+                     (bset-u8! out (+ offset i) b)))))
+            (recur (+ offset chunk)))))))
+
+  (rng-state [_]
+    @state-atom)
+
+  (fork-rng [_ branch-id]
+    #?(:clj
+       (let [cur (long @state-atom)
+             salt (branch-id->long branch-id)
+             new-seed (mix64-step (bit-xor cur salt))]
+         (SplitMix64. (atom new-seed)))
+       :cljs
+       (let [cur (if (js* "typeof ~{} === 'bigint'" @state-atom) @state-atom (js/BigInt (str (or @state-atom 0))))
+             salt (branch-id->bi branch-id)
+             new-seed (mix64-bi (js* "(~{} ^ ~{}) & 18446744073709551615n" cur salt))]
+         (SplitMix64. (atom (js/BigInt.asIntN 64 new-seed))))))
+
+  #?(:clj clojure.lang.IDeref :cljs IDeref)
+  (#?(:clj deref :cljs -deref) [_]
+    @state-atom))
+
+(defn make-rng
+  "Constructs a deterministic SplitMix64 pseudo-random number generator from `seed`."
+  [seed]
+  (cond
+    (instance? SplitMix64 seed)
+    (SplitMix64. (atom (rng-state seed)))
+
+    (satisfies? IDeterministicRng seed)
+    (SplitMix64. (atom (rng-state seed)))
+
+    :else
+    #?(:clj
+       (let [s (cond
+                 (number? seed) (.longValue ^Number seed)
+                 (string? seed) (try (Long/parseLong seed) (catch Exception _ (branch-id->long seed)))
+                 (nil? seed) (long 0)
+                 :else (long (hash seed)))]
+         (SplitMix64. (atom s)))
+       :cljs
+       (let [s (cond
+                 (js* "typeof ~{} === 'bigint'" seed) seed
+                 (number? seed) (js/BigInt (str (long seed)))
+                 (string? seed) (try (js/BigInt seed) (catch :default _ (branch-id->bi seed)))
+                 (nil? seed) (js/BigInt 0)
+                 :else (js/BigInt (str (hash seed))))]
+         (SplitMix64. (atom (js/BigInt.asIntN 64 s)))))))
+
 (defn random-bytes
-  "Generates `n` cryptographically random bytes."
-  [n]
-  #?(:clj (let [b (byte-array (int n))]
-            (.nextBytes secure-rand b)
-            b)
-     :cljs (if node-crypto
-             (js/Uint8Array. (.randomBytes node-crypto (int n)))
-             (let [b (js/Uint8Array. (int n))]
-               (when (and (exists? js/crypto) (.-getRandomValues js/crypto))
-                 (.getRandomValues js/crypto b))
-               b))))
+  "Generates `n` cryptographically random bytes (or deterministic bytes when `rng` is provided)."
+  ([n]
+   (random-bytes n nil))
+  ([n rng]
+   (if rng
+     (next-bytes rng n)
+     #?(:clj (let [b (byte-array (int n))]
+               (.nextBytes secure-rand b)
+               b)
+        :cljs (if node-crypto
+                (js/Uint8Array. (.randomBytes node-crypto (int n)))
+                (let [b (js/Uint8Array. (int n))]
+                  (when (and (exists? js/crypto) (.-getRandomValues js/crypto))
+                    (.getRandomValues js/crypto b))
+                  b))))))
 
 (defn random-int
-  "Generates a cryptographically random non-negative integer in `[0, bound)`."
-  ^long [^long bound]
-  #?(:clj (.nextInt secure-rand (int bound))
-     :cljs (let [bs (random-bytes 4)
-                 u32 (bit-or (bit-shift-left (bget-u8 bs 0) 24)
-                             (bit-shift-left (bget-u8 bs 1) 16)
-                             (bit-shift-left (bget-u8 bs 2) 8)
-                             (bget-u8 bs 3))
-                 unsigned (bit-and u32 0x7FFFFFFF)]
-             (mod unsigned bound))))
+  "Generates a cryptographically random non-negative integer in `[0, bound)` (or deterministic integer when `rng` is provided)."
+  (^long [^long bound]
+   (random-int bound nil))
+  (^long [^long bound rng]
+   (if rng
+     (let [u32 (next-u32 rng)
+           unsigned (bit-and u32 0x7FFFFFFF)]
+       (mod unsigned bound))
+     #?(:clj (.nextInt secure-rand (int bound))
+        :cljs (let [bs (random-bytes 4)
+                    u32 (bit-or (bit-shift-left (bget-u8 bs 0) 24)
+                                (bit-shift-left (bget-u8 bs 1) 16)
+                                (bit-shift-left (bget-u8 bs 2) 8)
+                                (bget-u8 bs 3))
+                    unsigned (bit-and u32 0x7FFFFFFF)]
+                (mod unsigned bound))))))
 
 (defn random-u64
-  "Generates a random 64-bit integer (truncated to safe 53-bit positive integer on JS so it fits cleanly in numbers, or full long on JVM)."
-  ^long []
-  #?(:clj (.nextLong secure-rand)
-     :cljs (let [bs (random-bytes 7)]
-             (loop [i 0
-                    acc 0]
-               (if (= i 6)
-                 (+ (* acc 128) (bit-and (bget-u8 bs 6) 0x7F))
-                 (recur (inc i) (+ (* acc 256) (bget-u8 bs i))))))))
+  "Generates a random 64-bit integer (or deterministic 64-bit integer when `rng` is provided)."
+  (^long []
+   (random-u64 nil))
+  (^long [rng]
+   (if rng
+     (next-u64 rng)
+     #?(:clj (.nextLong secure-rand)
+        :cljs (let [bs (random-bytes 7)]
+                (loop [i 0
+                       acc 0]
+                  (if (= i 6)
+                    (+ (* acc 128) (bit-and (bget-u8 bs 6) 0x7F))
+                    (recur (inc i) (+ (* acc 256) (bget-u8 bs i))))))))))
 
 (defn now-ms
   "Returns current wall-clock epoch milliseconds."
@@ -358,10 +529,11 @@
        (when (> (+ pos 8) lim)
          (throw (ex-info "Buffer underflow" {:pos pos :limit lim :need 8})))
        (let [le? (= order :little-endian)
-             hi (.getUint32 dv (if le? (+ pos 4) pos) le?)
-             lo (.getUint32 dv (if le? pos (+ pos 4)) le?)]
+             bi (.getBigInt64 dv pos le?)]
          (set! pos (+ pos 8))
-         (+ (* (bit-and hi 0x1FFFFF) 4294967296) lo)))
+         (if (js* "(~{} >= -9007199254740991n && ~{} <= 9007199254740991n)" bi bi)
+           (js/Number bi)
+           bi)))
      (buf-get-u32-at [_ idx]
        (let [le? (= order :little-endian)]
          (.getUint32 dv idx le?)))
@@ -401,14 +573,10 @@
        (when (> (+ pos 8) lim)
          (throw (ex-info "Buffer overflow" {:pos pos :limit lim :need 8})))
        (let [le? (= order :little-endian)
-             pos-v (if (neg? v) (+ v 9007199254740992) v)
-             hi (js/Math.floor (/ pos-v 4294967296))
-             lo (unsigned-bit-shift-right (mod pos-v 4294967296) 0)]
-         (if le?
-           (do (.setUint32 dv pos lo true)
-               (.setUint32 dv (+ pos 4) hi true))
-           (do (.setUint32 dv pos hi false)
-               (.setUint32 dv (+ pos 4) lo false)))
+             bi (if (js* "typeof ~{} === 'bigint'" v)
+                  (js/BigInt.asIntN 64 v)
+                  (js/BigInt (str (long (or v 0)))))]
+         (.setBigInt64 dv pos bi le?)
          (set! pos (+ pos 8))
          this))
      (buf-put-bytes! [this src]
@@ -464,9 +632,11 @@
 (defn compare-u64
   "Compares two 64-bit integers `a` and `b` as unsigned 64-bit numbers.
    Returns negative, zero, or positive integer."
-  ^long [^long a ^long b]
-  #?(:clj (Long/compareUnsigned a b)
-     :cljs (compare a b)))
+  ^long [a b]
+  #?(:clj (Long/compareUnsigned (long a) (long b))
+     :cljs (let [ua (js/BigInt.asUintN 64 (if (js* "typeof ~{} === 'bigint'" a) a (js/BigInt (str (long (or a 0))))))
+                 ub (js/BigInt.asUintN 64 (if (js* "typeof ~{} === 'bigint'" b) b (js/BigInt (str (long (or b 0))))))]
+             (cond (< ua ub) -1 (> ua ub) 1 :else 0))))
 
 (defn s32-diff
   "Computes signed 32-bit serial difference `(a - b)` wrapped to `[-2147483648, 2147483647]` per RFC 4960."

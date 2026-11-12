@@ -243,7 +243,7 @@
   ([username realm password nonce opts]
    (let [buf (b/allocate-buffer 1024)
          _ (b/buf-set-order! buf :big-endian)
-         tx-id (or (:tx-id opts) (b/random-bytes 12))
+         tx-id (or (:tx-id opts) (b/random-bytes 12 (:rng opts)))
          lifetime (long (or (:lifetime opts) 600))]
      (put-u16 buf METHOD_ALLOCATE_REQUEST)
      (put-u16 buf 0)
@@ -275,7 +275,7 @@
   [username realm password nonce lifetime & [opts]]
   (let [buf (b/allocate-buffer 1024)
         _ (b/buf-set-order! buf :big-endian)
-        tx-id (or (:tx-id opts) (b/random-bytes 12))]
+        tx-id (or (:tx-id opts) (b/random-bytes 12 (:rng opts)))]
     (put-u16 buf METHOD_REFRESH_REQUEST)
     (put-u16 buf 0)
     (b/buf-put-u32! buf stun/magic-cookie)
@@ -295,7 +295,7 @@
   [username realm password nonce peer-addr & [opts]]
   (let [buf (b/allocate-buffer 1024)
         _ (b/buf-set-order! buf :big-endian)
-        tx-id (or (:tx-id opts) (b/random-bytes 12))
+        tx-id (or (:tx-id opts) (b/random-bytes 12 (:rng opts)))
         xor-peer (encode-xor-address peer-addr stun/magic-cookie)]
     (put-u16 buf METHOD_CREATE_PERMISSION_REQUEST)
     (put-u16 buf 0)
@@ -318,7 +318,7 @@
   [username realm password nonce channel-number peer-addr & [opts]]
   (let [buf (b/allocate-buffer 1024)
         _ (b/buf-set-order! buf :big-endian)
-        tx-id (or (:tx-id opts) (b/random-bytes 12))
+        tx-id (or (:tx-id opts) (b/random-bytes 12 (:rng opts)))
         xor-peer (encode-xor-address peer-addr stun/magic-cookie)]
     (put-u16 buf METHOD_CHANNEL_BIND_REQUEST)
     (put-u16 buf 0)
@@ -345,7 +345,7 @@
   [peer-addr data-bytes & [opts]]
   (let [buf (b/allocate-buffer 4096)
         _ (b/buf-set-order! buf :big-endian)
-        tx-id (or (:tx-id opts) (b/random-bytes 12))
+        tx-id (or (:tx-id opts) (b/random-bytes 12 (:rng opts)))
         xor-peer (encode-xor-address peer-addr stun/magic-cookie)
         data (if (string? data-bytes) (b/utf8->bytes data-bytes) (b/to-bytes data-bytes))
         d-len (b/blength data)
@@ -368,7 +368,7 @@
   [peer-addr data-bytes & [opts]]
   (let [buf (b/allocate-buffer 4096)
         _ (b/buf-set-order! buf :big-endian)
-        tx-id (or (:tx-id opts) (b/random-bytes 12))
+        tx-id (or (:tx-id opts) (b/random-bytes 12 (:rng opts)))
         xor-peer (encode-xor-address peer-addr stun/magic-cookie)
         data (if (string? data-bytes) (b/utf8->bytes data-bytes) (b/to-bytes data-bytes))
         d-len (b/blength data)
@@ -620,6 +620,7 @@
   "Initializes pure Sans-IO TURN client state map."
   [opts]
   {:state :idle
+   :rng (:rng opts)
    :username (:username opts)
    :password (:password opts)
    :realm (:realm opts)
@@ -643,16 +644,20 @@
    :dropped-frames 0
    :last-error nil})
 
+(def create-client
+  "Alias for init-turn-client."
+  init-turn-client)
+
 (defn start-allocation
   "Initiates TURN allocation, returning {:new-state ... :network-out [...] :events [...]}."
   [client-state & [opts]]
-  (let [tx-id (b/random-bytes 12)
+  (let [tx-id (b/random-bytes 12 (:rng client-state))
         tx-k (tx-key tx-id)
         alloc-req (make-allocate-request (:username client-state)
                                          (:realm client-state)
                                          (:password client-state)
                                          (:nonce client-state)
-                                         (assoc opts :tx-id tx-id :lifetime (:lifetime client-state)))
+                                         (assoc opts :tx-id tx-id :rng (:rng client-state) :lifetime (:lifetime client-state)))
         new-state (-> client-state
                       (assoc :state (if (:nonce client-state) :allocating-authenticated :allocating))
                       (assoc-in [:pending-tx tx-k] {:action :allocate :opts opts}))]
@@ -663,14 +668,14 @@
 (defn request-permission
   "Constructs CreatePermission request and records pending permission in client state."
   [client-state peer-addr & [opts]]
-  (let [tx-id (b/random-bytes 12)
+  (let [tx-id (b/random-bytes 12 (:rng client-state))
         tx-k (tx-key tx-id)
         req (make-create-permission-request (:username client-state)
                                             (:realm client-state)
                                             (:password client-state)
                                             (:nonce client-state)
                                             peer-addr
-                                            (assoc opts :tx-id tx-id))
+                                            (assoc opts :tx-id tx-id :rng (:rng client-state)))
         new-state (assoc-in client-state [:pending-tx tx-k] {:action :create-permission :peer-addr peer-addr})]
     {:new-state new-state
      :network-out [req]
@@ -681,7 +686,7 @@
   [client-state channel-number peer-addr & [opts]]
   (when-not (and (>= channel-number MIN_CHANNEL_NUMBER) (<= channel-number MAX_CHANNEL_NUMBER))
     (throw (ex-info "Invalid channel number (must be 0x4000..0x7FFF)" {:channel-number channel-number})))
-  (let [tx-id (b/random-bytes 12)
+  (let [tx-id (b/random-bytes 12 (:rng client-state))
         tx-k (tx-key tx-id)
         req (make-channel-bind-request (:username client-state)
                                        (:realm client-state)
@@ -689,7 +694,7 @@
                                        (:nonce client-state)
                                        channel-number
                                        peer-addr
-                                       (assoc opts :tx-id tx-id))
+                                       (assoc opts :tx-id tx-id :rng (:rng client-state)))
         new-state (assoc-in client-state [:pending-tx tx-k] {:action :channel-bind
                                                              :channel-number channel-number
                                                              :peer-addr peer-addr})]
@@ -700,7 +705,7 @@
 (defn request-refresh
   "Constructs Refresh request to extend or terminate allocation."
   [client-state lifetime & [opts]]
-  (let [tx-id (b/random-bytes 12)
+  (let [tx-id (b/random-bytes 12 (:rng client-state))
         tx-k (tx-key tx-id)
         now-ms (long (or (:now-ms opts) (b/now-ms)))
         req (make-refresh-request (:username client-state)
@@ -708,7 +713,7 @@
                                   (:password client-state)
                                   (:nonce client-state)
                                   lifetime
-                                  (assoc opts :tx-id tx-id))
+                                  (assoc opts :tx-id tx-id :rng (:rng client-state)))
         new-state (assoc-in client-state [:pending-tx tx-k] {:action :refresh
                                                              :lifetime lifetime
                                                              :sent-at-ms now-ms})]
@@ -729,7 +734,7 @@
                        (get-in client-state [:peer->channel ip]))
             frame (if ch
                     (encode-channel-data ch payload-bytes)
-                    (make-send-indication peer-addr payload-bytes))]
+                    (make-send-indication peer-addr payload-bytes {:rng (:rng client-state)}))]
         {:ok? true :network-out [frame]}))))
 
 (defn- normalize-peer-sock-addr [peer-addr]
@@ -843,7 +848,7 @@
                          (< retries max-retries))
                   (let [realm (:realm parsed)
                         nonce (:nonce parsed)
-                        retry-tx-id (b/random-bytes 12)
+                        retry-tx-id (b/random-bytes 12 (:rng client-state))
                         retry-tx-k (tx-key retry-tx-id)
                         user (:username client-state)
                         pass (:password client-state)
@@ -851,24 +856,24 @@
                         (case act
                           :refresh
                           (let [lt (or (:lifetime pending) (:lifetime client-state) 600)]
-                            [(make-refresh-request user realm pass nonce lt {:tx-id retry-tx-id})
+                            [(make-refresh-request user realm pass nonce lt {:tx-id retry-tx-id :rng (:rng client-state)})
                              {:action :refresh :lifetime lt :sent-at-ms now}
                              (:state client-state)])
 
                           :create-permission
                           (let [pa (:peer-addr pending)]
-                            [(make-create-permission-request user realm pass nonce pa {:tx-id retry-tx-id})
+                            [(make-create-permission-request user realm pass nonce pa {:tx-id retry-tx-id :rng (:rng client-state)})
                              {:action :create-permission :peer-addr pa}
                              (:state client-state)])
 
                           :channel-bind
                           (let [ch (:channel-number pending)
                                 pa (:peer-addr pending)]
-                            [(make-channel-bind-request user realm pass nonce ch pa {:tx-id retry-tx-id})
+                            [(make-channel-bind-request user realm pass nonce ch pa {:tx-id retry-tx-id :rng (:rng client-state)})
                              {:action :channel-bind :channel-number ch :peer-addr pa}
                              (:state client-state)])
 
-                          [(make-allocate-request user realm pass nonce {:tx-id retry-tx-id :lifetime (:lifetime client-state)})
+                          [(make-allocate-request user realm pass nonce {:tx-id retry-tx-id :rng (:rng client-state) :lifetime (:lifetime client-state)})
                            {:action :allocate-auth}
                            :allocating-authenticated])]
                     {:new-state (-> new-client-state

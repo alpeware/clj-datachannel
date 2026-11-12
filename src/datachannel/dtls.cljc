@@ -46,7 +46,9 @@
     "Decrypts an incoming DTLS application data packet.
      Returns `{:status <status> :bytes <byte-array>}`.")
   (peer-fingerprint [engine]
-    "Returns the peer certificate's uppercase colon-separated SHA-256 fingerprint string, or nil."))
+    "Returns the peer certificate's uppercase colon-separated SHA-256 fingerprint string, or nil.")
+  (handle-timeout [engine now-ms]
+    "Handles flight timeout or timer tick for DTLS engine."))
 
 (defn verify-peer-fingerprint
   "Verifies that the primary peer certificate extracted from `engine` matches `expected-fingerprint`."
@@ -61,7 +63,8 @@
     (catch #?(:clj Exception :cljs :default) _
       false)))
 
-(defn- format-sha256-fingerprint
+(defn format-sha256-fingerprint
+  "Formats raw DER certificate bytes into uppercase colon-separated SHA-256 hex string."
   [der-bytes]
   (let [digest (b/sha256-bytes der-bytes)
         len (b/blength digest)]
@@ -73,6 +76,536 @@
               hex (str/upper-case #?(:clj (Integer/toHexString v) :cljs (.toString v 16)))]
           (recur (inc i)
                  (conj! parts (if (< (count hex) 2) (str "0" hex) hex))))))))
+
+;; =============================================================================
+;; 1b. Pure Persistent `SimulatedDtlsEngine` (Cross-Platform)
+;; =============================================================================
+
+(def ^:const SIM-DTLS-VERSION "DTLS 1.2 protocol version (0xFEFD)." 0xFEFD)
+(def ^:const SIM-CONTENT-TYPE-CHANGE-CIPHER-SPEC "DTLS ChangeCipherSpec content type (20)." 20)
+(def ^:const SIM-CONTENT-TYPE-ALERT "DTLS Alert content type (21)." 21)
+(def ^:const SIM-CONTENT-TYPE-HANDSHAKE "DTLS Handshake content type (22)." 22)
+(def ^:const SIM-CONTENT-TYPE-APP-DATA "DTLS Application Data content type (23)." 23)
+
+(def ^:const SIM-HS-CLIENT-HELLO "DTLS Handshake ClientHello message type (1)." 1)
+(def ^:const SIM-HS-SERVER-HELLO "DTLS Handshake ServerHello message type (2)." 2)
+(def ^:const SIM-HS-HELLO-VERIFY-REQUEST "DTLS Handshake HelloVerifyRequest message type (3)." 3)
+(def ^:const SIM-HS-CERTIFICATE "DTLS Handshake Certificate message type (11)." 11)
+(def ^:const SIM-HS-FINISHED "DTLS Handshake Finished message type (20)." 20)
+
+(defn- sim-make-record
+  [content-type epoch seq-num fragment]
+  (let [flen (b/blength fragment)
+        buf (b/allocate-buffer (+ 13 flen))]
+    (b/buf-put-u8! buf (long content-type))
+    (b/buf-put-u16! buf SIM-DTLS-VERSION)
+    (b/buf-put-u16! buf (bit-and (long epoch) 0xFFFF))
+    (b/buf-put-u16! buf (bit-and (unsigned-bit-shift-right (long seq-num) 32) 0xFFFF))
+    (b/buf-put-u32! buf (bit-and (long seq-num) 0xFFFFFFFF))
+    (b/buf-put-u16! buf (bit-and flen 0xFFFF))
+    (b/buf-put-bytes! buf fragment)
+    (b/buf-flip! buf)
+    (b/buf->bytes buf)))
+
+(defn- sim-make-hs-msg
+  [msg-type msg-seq body]
+  (let [blen (b/blength body)
+        buf (b/allocate-buffer (+ 12 blen))]
+    (b/buf-put-u8! buf (long msg-type))
+    (b/buf-put-u8! buf (bit-and (unsigned-bit-shift-right blen 16) 0xFF))
+    (b/buf-put-u16! buf (bit-and blen 0xFFFF))
+    (b/buf-put-u16! buf (bit-and (long msg-seq) 0xFFFF))
+    (b/buf-put-u8! buf 0)
+    (b/buf-put-u16! buf 0)
+    (b/buf-put-u8! buf (bit-and (unsigned-bit-shift-right blen 16) 0xFF))
+    (b/buf-put-u16! buf (bit-and blen 0xFFFF))
+    (b/buf-put-bytes! buf body)
+    (b/buf-flip! buf)
+    (b/buf->bytes buf)))
+
+(defn- make-client-hello-body
+  [client-random cookie fingerprint]
+  (let [cookie-len (b/blength cookie)
+        fp-bytes (b/utf8->bytes (or fingerprint ""))
+        fp-len (b/blength fp-bytes)
+        exts-len (+ 4 fp-len)
+        body-len (+ 2 32 1 (inc cookie-len) 4 2 2 exts-len)
+        buf (b/allocate-buffer body-len)]
+    (b/buf-put-u16! buf SIM-DTLS-VERSION)
+    (b/buf-put-bytes! buf client-random)
+    (b/buf-put-u8! buf 0)
+    (b/buf-put-u8! buf cookie-len)
+    (when (pos? cookie-len)
+      (b/buf-put-bytes! buf cookie))
+    (b/buf-put-u16! buf 2)
+    (b/buf-put-u16! buf 0xC02B)
+    (b/buf-put-u8! buf 1)
+    (b/buf-put-u8! buf 0)
+    (b/buf-put-u16! buf exts-len)
+    (b/buf-put-u16! buf 0xFF01)
+    (b/buf-put-u16! buf fp-len)
+    (b/buf-put-bytes! buf fp-bytes)
+    (b/buf-flip! buf)
+    (b/buf->bytes buf)))
+
+(defn- make-hello-verify-body
+  [cookie]
+  (let [cookie-len (b/blength cookie)
+        buf (b/allocate-buffer (+ 3 cookie-len))]
+    (b/buf-put-u16! buf SIM-DTLS-VERSION)
+    (b/buf-put-u8! buf cookie-len)
+    (when (pos? cookie-len)
+      (b/buf-put-bytes! buf cookie))
+    (b/buf-flip! buf)
+    (b/buf->bytes buf)))
+
+(defn- make-server-hello-body
+  [server-random]
+  (let [buf (b/allocate-buffer 38)]
+    (b/buf-put-u16! buf SIM-DTLS-VERSION)
+    (b/buf-put-bytes! buf server-random)
+    (b/buf-put-u8! buf 0)
+    (b/buf-put-u16! buf 0xC02B)
+    (b/buf-put-u8! buf 0)
+    (b/buf-flip! buf)
+    (b/buf->bytes buf)))
+
+(defn- make-certificate-body
+  [fingerprint]
+  (let [fp-bytes (b/utf8->bytes (or fingerprint ""))
+        clen (b/blength fp-bytes)
+        total-len (+ clen 3)
+        buf (b/allocate-buffer (+ 6 clen))]
+    (b/buf-put-u8! buf (bit-and (unsigned-bit-shift-right total-len 16) 0xFF))
+    (b/buf-put-u16! buf (bit-and total-len 0xFFFF))
+    (b/buf-put-u8! buf (bit-and (unsigned-bit-shift-right clen 16) 0xFF))
+    (b/buf-put-u16! buf (bit-and clen 0xFFFF))
+    (b/buf-put-bytes! buf fp-bytes)
+    (b/buf-flip! buf)
+    (b/buf->bytes buf)))
+
+(defn- make-finished-body
+  [verify-data]
+  (b/bslice verify-data 0 (min 16 (b/blength verify-data))))
+
+(defn- parse-dtls-record
+  [bs]
+  (when (and bs (>= (b/blength bs) 13))
+    (let [ctype (b/bget-u8 bs 0)
+          ver (bit-or (bit-shift-left (b/bget-u8 bs 1) 8) (b/bget-u8 bs 2))
+          epoch (bit-or (bit-shift-left (b/bget-u8 bs 3) 8) (b/bget-u8 bs 4))
+          seq-hi (bit-or (bit-shift-left (b/bget-u8 bs 5) 8) (b/bget-u8 bs 6))
+          seq-lo (bit-or (bit-shift-left (b/bget-u8 bs 7) 24)
+                         (bit-shift-left (b/bget-u8 bs 8) 16)
+                         (bit-shift-left (b/bget-u8 bs 9) 8)
+                         (b/bget-u8 bs 10))
+          seq-num (+ (* (long seq-hi) 4294967296) (bit-and (long seq-lo) 0xFFFFFFFF))
+          flen (bit-or (bit-shift-left (b/bget-u8 bs 11) 8) (b/bget-u8 bs 12))
+          frag (when (>= (b/blength bs) (+ 13 flen))
+                 (b/bslice bs 13 (+ 13 flen)))]
+      {:content-type ctype
+       :version ver
+       :epoch epoch
+       :seq-num seq-num
+       :length flen
+       :fragment frag})))
+
+(defn- parse-all-hs-msgs
+  [frag]
+  (when (and frag (>= (b/blength frag) 12))
+    (let [total (b/blength frag)]
+      (loop [offset 0
+             acc []]
+        (if (>= (+ offset 12) total)
+          acc
+          (let [mtype (b/bget-u8 frag offset)
+                mlen (bit-or (bit-shift-left (b/bget-u8 frag (+ offset 1)) 16)
+                             (bit-shift-left (b/bget-u8 frag (+ offset 2)) 8)
+                             (b/bget-u8 frag (+ offset 3)))
+                mseq (bit-or (bit-shift-left (b/bget-u8 frag (+ offset 4)) 8)
+                             (b/bget-u8 frag (+ offset 5)))
+                body (when (<= (+ offset 12 mlen) total)
+                       (b/bslice frag (+ offset 12) (+ offset 12 mlen)))]
+            (if body
+              (recur (+ offset 12 mlen) (conj acc {:msg-type mtype :length mlen :msg-seq mseq :body body}))
+              acc)))))))
+
+(defn- parse-client-hello-body
+  [body]
+  (let [blen (b/blength body)]
+    (if (< blen 35)
+      {:cookie b/empty-bytes :client-fp nil :client-random nil}
+      (let [client-random (b/bslice body 2 34)
+            sid-len (b/bget-u8 body 34)
+            cookie-offset (+ 35 sid-len)]
+        (if (>= cookie-offset blen)
+          {:cookie b/empty-bytes :client-fp nil :client-random client-random}
+          (let [cookie-len (b/bget-u8 body cookie-offset)
+                cookie (if (pos? cookie-len)
+                         (b/bslice body (inc cookie-offset) (+ (inc cookie-offset) cookie-len))
+                         b/empty-bytes)
+                after-cookie (+ (inc cookie-offset) cookie-len)
+                fp (try
+                     (when (< (+ after-cookie 4) blen)
+                       (let [cs-len (bit-or (bit-shift-left (b/bget-u8 body after-cookie) 8)
+                                            (b/bget-u8 body (inc after-cookie)))
+                             after-cs (+ after-cookie 2 cs-len)
+                             comp-len (b/bget-u8 body after-cs)
+                             after-comp (+ after-cs 1 comp-len)
+                             exts-len (bit-or (bit-shift-left (b/bget-u8 body after-comp) 8)
+                                              (b/bget-u8 body (inc after-comp)))
+                             exts-start (+ after-comp 2)
+                             exts-end (+ exts-start exts-len)]
+                         (loop [cur exts-start]
+                           (when (< (+ cur 4) exts-end)
+                             (let [etype (bit-or (bit-shift-left (b/bget-u8 body cur) 8)
+                                                 (b/bget-u8 body (inc cur)))
+                                   elen (bit-or (bit-shift-left (b/bget-u8 body (+ cur 2)) 8)
+                                                (b/bget-u8 body (+ cur 3)))
+                                   edata (b/bslice body (+ cur 4) (+ cur 4 elen))]
+                               (if (= etype 0xFF01)
+                                 (b/bytes->utf8 edata)
+                                 (recur (+ cur 4 elen))))))))
+                     (catch #?(:clj Exception :cljs :default) _ nil))]
+            {:cookie cookie :client-fp fp :client-random client-random}))))))
+
+(defn- parse-hello-verify-body
+  [body]
+  (let [blen (b/blength body)]
+    (if (< blen 3)
+      b/empty-bytes
+      (let [cookie-len (b/bget-u8 body 2)]
+        (if (and (pos? cookie-len) (<= (+ 3 cookie-len) blen))
+          (b/bslice body 3 (+ 3 cookie-len))
+          b/empty-bytes)))))
+
+(defn- parse-cert-body
+  [body]
+  (try
+    (let [blen (b/blength body)]
+      (when (>= blen 6)
+        (let [clen (bit-or (bit-shift-left (b/bget-u8 body 3) 16)
+                           (bit-shift-left (b/bget-u8 body 4) 8)
+                           (b/bget-u8 body 5))
+              cert1 (b/bslice body 6 (+ 6 clen))]
+          (b/bytes->utf8 cert1))))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
+
+(declare map->SimulatedDtlsEngine)
+
+(defrecord ^{:doc "Pure Sans-IO immutable record implementing IDtlsEngine for deterministic simulation."}
+ SimulatedDtlsEngine [role
+                      phase
+                      local-fingerprint
+                      remote-fingerprint
+                      peer-fingerprint
+                      cookie-secret
+                      client-random
+                      server-random
+                      epoch
+                      tx-seq
+                      rx-seq
+                      rx-window
+                      finished?
+                      last-flight
+                      symmetric-key]
+  IDtlsEngine
+  (begin-handshake! [this]
+    (if (:finished? this)
+      {:status :ok :finished? true :packets [] :engine this}
+      (if (= (:role this) :client)
+        (let [client-random (or (:client-random this) (b/random-bytes 32))
+              ch-body (make-client-hello-body client-random b/empty-bytes (:local-fingerprint this))
+              hs-msg (sim-make-hs-msg SIM-HS-CLIENT-HELLO 0 ch-body)
+              record (sim-make-record SIM-CONTENT-TYPE-HANDSHAKE 0 0 hs-msg)
+              upd (assoc this
+                         :phase :wait-hello-verify
+                         :last-flight [record]
+                         :tx-seq 1)]
+          {:status :handshaking
+           :finished? false
+           :packets [record]
+           :engine upd})
+        {:status :handshaking
+         :finished? false
+         :packets []
+         :engine (assoc this :phase :wait-client-hello)})))
+
+  (handshake-finished? [this]
+    (boolean (:finished? this)))
+
+  (peer-fingerprint [this]
+    (:peer-fingerprint this))
+
+  (handle-timeout [this _now-ms]
+    (handshake-step this b/empty-bytes))
+
+  (handshake-step [this in-bytes]
+    (cond
+      ;; Retransmission / tick
+      (or (nil? in-bytes) (zero? (b/blength in-bytes)))
+      (if (:finished? this)
+        {:status :ok :finished? true :packets [] :app-data nil :engine this}
+        {:status :handshaking
+         :finished? false
+         :packets (vec (:last-flight this))
+         :app-data nil
+         :engine this})
+
+      ;; Inbound packet
+      :else
+      (let [rec (parse-dtls-record in-bytes)]
+        (if-not rec
+          {:status :error :finished? (:finished? this) :packets [] :app-data nil :engine this}
+          (let [hs-msgs (parse-all-hs-msgs (:fragment rec))]
+            (if (empty? hs-msgs)
+              {:status :error :finished? (:finished? this) :packets [] :app-data nil :engine this}
+              (loop [[hs & more] hs-msgs
+                     cur-engine this
+                     acc-packets []
+                     fin? (:finished? cur-engine)]
+                (if-not hs
+                  {:status (if fin? :ok :handshaking)
+                   :finished? fin?
+                   :packets acc-packets
+                   :app-data nil
+                   :engine cur-engine}
+                  (case (:msg-type hs)
+                    ;; 1: ClientHello (Server receives)
+                    1
+                    (let [{:keys [cookie client-fp client-random]} (parse-client-hello-body (:body hs))
+                          client-fp-bytes (b/utf8->bytes (or client-fp ""))
+                          expected-cookie (b/hmac-sha256 (:cookie-secret cur-engine)
+                                                         (b/bconcat [client-random client-fp-bytes]))]
+                      (if (and (pos? (b/blength cookie)) (b/bytes= cookie expected-cookie))
+                        ;; Flight 3 -> ServerHello + Certificate + Finished (coalesced in 1 record)
+                        (let [server-random (or (:server-random cur-engine) (b/random-bytes 32))
+                              sh-body (make-server-hello-body server-random)
+                              sh-msg (sim-make-hs-msg SIM-HS-SERVER-HELLO 1 sh-body)
+                              cert-body (make-certificate-body (:local-fingerprint cur-engine))
+                              cert-msg (sim-make-hs-msg SIM-HS-CERTIFICATE 2 cert-body)
+                              server-fp (or (:local-fingerprint cur-engine) "")
+                              sym-key (b/hmac-sha256 (b/utf8->bytes "simulated-dtls-key")
+                                                     (b/utf8->bytes (str (or client-fp "") ":" server-fp)))
+                              fin-body (make-finished-body (b/hmac-sha256 sym-key (b/utf8->bytes "server-finished")))
+                              fin-msg (sim-make-hs-msg SIM-HS-FINISHED 3 fin-body)
+                              tx-seq (:tx-seq cur-engine 0)
+                              flight-fragment (b/bconcat [sh-msg cert-msg fin-msg])
+                              server-rec (sim-make-record SIM-CONTENT-TYPE-HANDSHAKE 0 tx-seq flight-fragment)
+                              upd (assoc cur-engine
+                                         :phase :wait-client-finished
+                                         :peer-fingerprint client-fp
+                                         :symmetric-key sym-key
+                                         :last-flight [server-rec]
+                                         :tx-seq (inc tx-seq))]
+                          (recur more upd (conj acc-packets server-rec) false))
+                        ;; Flight 1 (or forged/corrupted cookie on Flight 3) -> HelloVerifyRequest
+                        (let [hvr-body (make-hello-verify-body expected-cookie)
+                              hvr-msg (sim-make-hs-msg SIM-HS-HELLO-VERIFY-REQUEST 0 hvr-body)
+                              tx-seq (:tx-seq cur-engine 0)
+                              hvr-rec (sim-make-record SIM-CONTENT-TYPE-HANDSHAKE 0 tx-seq hvr-msg)
+                              upd (assoc cur-engine
+                                         :phase :wait-client-hello-cookie
+                                         :last-flight [hvr-rec]
+                                         :tx-seq (inc tx-seq))]
+                          (recur more upd (conj acc-packets hvr-rec) false))))
+
+                    ;; 3: HelloVerifyRequest (Client receives)
+                    3
+                    (let [cookie (parse-hello-verify-body (:body hs))
+                          client-random (or (:client-random cur-engine) (b/random-bytes 32))
+                          ch-body (make-client-hello-body client-random cookie (:local-fingerprint cur-engine))
+                          ch-msg (sim-make-hs-msg SIM-HS-CLIENT-HELLO 1 ch-body)
+                          tx-seq (:tx-seq cur-engine 0)
+                          ch-rec (sim-make-record SIM-CONTENT-TYPE-HANDSHAKE 0 tx-seq ch-msg)
+                          upd (assoc cur-engine
+                                     :phase :wait-server-flight
+                                     :last-flight [ch-rec]
+                                     :tx-seq (inc tx-seq))]
+                      (recur more upd (conj acc-packets ch-rec) false))
+
+                    ;; 2: ServerHello (Client receives)
+                    2
+                    (recur more cur-engine acc-packets fin?)
+
+                    ;; 11: Certificate (Client receives)
+                    11
+                    (let [cert-fp (parse-cert-body (:body hs))
+                          upd (assoc cur-engine :peer-fingerprint cert-fp)]
+                      (recur more upd acc-packets fin?))
+
+                    ;; 20: Finished
+                    20
+                    (if (= (:role cur-engine) :client)
+                      ;; Client receives Finished -> verifies ServerFinished verify_data
+                      (let [client-fp (or (:local-fingerprint cur-engine) "")
+                            server-fp (or (:peer-fingerprint cur-engine) (:remote-fingerprint cur-engine) "")
+                            sym-key (b/hmac-sha256 (b/utf8->bytes "simulated-dtls-key")
+                                                   (b/utf8->bytes (str client-fp ":" server-fp)))
+                            expected-server-fin-body (make-finished-body (b/hmac-sha256 sym-key (b/utf8->bytes "server-finished")))]
+                        (if-not (b/bytes= (:body hs) expected-server-fin-body)
+                          {:status :handshake-failed :finished? false :packets [] :app-data nil :engine (assoc cur-engine :phase :failed)}
+                          (let [client-fin-body (make-finished-body (b/hmac-sha256 sym-key (b/utf8->bytes "client-finished")))
+                                fin-msg (sim-make-hs-msg SIM-HS-FINISHED 4 client-fin-body)
+                                tx-seq (:tx-seq cur-engine 0)
+                                fin-rec (sim-make-record SIM-CONTENT-TYPE-HANDSHAKE 0 tx-seq fin-msg)
+                                upd (assoc cur-engine
+                                           :phase :established
+                                           :peer-fingerprint server-fp
+                                           :symmetric-key sym-key
+                                           :epoch 1
+                                           :finished? true
+                                           :last-flight [fin-rec]
+                                           :tx-seq (inc tx-seq))]
+                            (recur more upd (conj acc-packets fin-rec) true))))
+                      ;; Server receives ClientFinished -> verifies ClientFinished verify_data
+                      (let [client-fp (or (:peer-fingerprint cur-engine) (:remote-fingerprint cur-engine) "")
+                            server-fp (or (:local-fingerprint cur-engine) "")
+                            sym-key (or (:symmetric-key cur-engine)
+                                        (b/hmac-sha256 (b/utf8->bytes "simulated-dtls-key")
+                                                       (b/utf8->bytes (str client-fp ":" server-fp))))
+                            expected-client-fin-body (make-finished-body (b/hmac-sha256 sym-key (b/utf8->bytes "client-finished")))]
+                        (if-not (b/bytes= (:body hs) expected-client-fin-body)
+                          {:status :handshake-failed :finished? false :packets [] :app-data nil :engine (assoc cur-engine :phase :failed)}
+                          (let [upd (assoc cur-engine
+                                           :phase :established
+                                           :epoch 1
+                                           :finished? true)]
+                            (recur more upd acc-packets true)))))
+
+                    (recur more cur-engine acc-packets fin?))))))))))
+
+  (wrap-app-data [this plain-bytes]
+    (let [seq-num (:tx-seq this 0)
+          epoch (:epoch this 1)
+          key (:symmetric-key this (b/alloc-bytes 32))
+          flen (b/blength plain-bytes)
+          explicit-nonce (let [buf (b/allocate-buffer 8)]
+                           (b/buf-put-u16! buf (bit-and epoch 0xFFFF))
+                           (b/buf-put-u16! buf (bit-and (unsigned-bit-shift-right seq-num 32) 0xFFFF))
+                           (b/buf-put-u32! buf (bit-and seq-num 0xFFFFFFFF))
+                           (b/buf-flip! buf)
+                           (b/buf->bytes buf))
+          aad (let [buf (b/allocate-buffer 13)]
+                (b/buf-put-u16! buf (bit-and epoch 0xFFFF))
+                (b/buf-put-u16! buf (bit-and (unsigned-bit-shift-right seq-num 32) 0xFFFF))
+                (b/buf-put-u32! buf (bit-and seq-num 0xFFFFFFFF))
+                (b/buf-put-u8! buf SIM-CONTENT-TYPE-APP-DATA)
+                (b/buf-put-u16! buf SIM-DTLS-VERSION)
+                (b/buf-put-u16! buf (bit-and flen 0xFFFF))
+                (b/buf-flip! buf)
+                (b/buf->bytes buf))
+          full-tag (b/hmac-sha256 key (b/bconcat [aad explicit-nonce plain-bytes]))
+          tag (b/bslice full-tag 0 16)
+          body (b/bconcat [explicit-nonce plain-bytes tag])
+          record (sim-make-record SIM-CONTENT-TYPE-APP-DATA epoch seq-num body)]
+      {:status :ok
+       :bytes record
+       :engine (assoc this :tx-seq (inc seq-num))}))
+
+  (unwrap-packet [this net-bytes]
+    (let [total-len (b/blength net-bytes)]
+      (if (< total-len (+ 13 8 16))
+        {:status :truncated :bytes nil :engine this}
+        (let [ctype (b/bget-u8 net-bytes 0)
+              ver (bit-or (bit-shift-left (b/bget-u8 net-bytes 1) 8) (b/bget-u8 net-bytes 2))
+              epoch (bit-or (bit-shift-left (b/bget-u8 net-bytes 3) 8) (b/bget-u8 net-bytes 4))
+              seq-hi (bit-or (bit-shift-left (b/bget-u8 net-bytes 5) 8) (b/bget-u8 net-bytes 6))
+              seq-lo (bit-or (bit-shift-left (b/bget-u8 net-bytes 7) 24)
+                             (bit-shift-left (b/bget-u8 net-bytes 8) 16)
+                             (bit-shift-left (b/bget-u8 net-bytes 9) 8)
+                             (b/bget-u8 net-bytes 10))
+              seq-num (+ (* (long seq-hi) 4294967296) (bit-and (long seq-lo) 0xFFFFFFFF))
+              flen (bit-or (bit-shift-left (b/bget-u8 net-bytes 11) 8) (b/bget-u8 net-bytes 12))]
+          (cond
+            (not= ctype SIM-CONTENT-TYPE-APP-DATA)
+            {:status :invalid-content-type :bytes nil :engine this}
+
+            (not= ver SIM-DTLS-VERSION)
+            {:status :invalid-version :bytes nil :engine this}
+
+            (not= epoch (:epoch this 1))
+            {:status :invalid-epoch :bytes nil :engine this}
+
+            (not= flen (- total-len 13))
+            {:status :length-mismatch :bytes nil :engine this}
+
+            :else
+            (let [body (b/bslice net-bytes 13 total-len)
+                  body-len (b/blength body)
+                  explicit-nonce (b/bslice body 0 8)
+                  plain-len (- body-len 24)
+                  plain (b/bslice body 8 (+ 8 plain-len))
+                  tag (b/bslice body (+ 8 plain-len) body-len)
+                  key (:symmetric-key this (b/alloc-bytes 32))
+                  aad (let [buf (b/allocate-buffer 13)]
+                        (b/buf-put-u16! buf (bit-and epoch 0xFFFF))
+                        (b/buf-put-u16! buf (bit-and (unsigned-bit-shift-right seq-num 32) 0xFFFF))
+                        (b/buf-put-u32! buf (bit-and seq-num 0xFFFFFFFF))
+                        (b/buf-put-u8! buf SIM-CONTENT-TYPE-APP-DATA)
+                        (b/buf-put-u16! buf SIM-DTLS-VERSION)
+                        (b/buf-put-u16! buf (bit-and plain-len 0xFFFF))
+                        (b/buf-flip! buf)
+                        (b/buf->bytes buf))
+                  expected-full-tag (b/hmac-sha256 key (b/bconcat [aad explicit-nonce plain]))
+                  expected-tag (b/bslice expected-full-tag 0 16)]
+              (if-not (b/bytes= tag expected-tag)
+                {:status :auth-tag-mismatch :bytes nil :engine this}
+                (let [rx-win (get this :rx-window #{})]
+                  (if (contains? rx-win seq-num)
+                    {:status :replay-dropped :bytes nil :engine this}
+                    {:status :ok
+                     :bytes plain
+                     :engine (-> this
+                                 (assoc :rx-seq seq-num)
+                                 (update :rx-window (fn [w] (conj (or w #{}) seq-num))))}))))))))))
+
+(defn generate-simulated-cert
+  "Generates a deterministic simulated self-signed certificate data map with SHA-256 fingerprint."
+  ([]
+   (generate-simulated-cert nil))
+  ([rng]
+   (let [raw (if rng (b/random-bytes 32 rng) (b/random-bytes 32))
+         fp (format-sha256-fingerprint raw)]
+     {:cert (b/alloc-bytes 64)
+      :fingerprint fp
+      :key (b/alloc-bytes 32)})))
+
+(defn create-simulated-engine
+  "Creates a pure persistent SimulatedDtlsEngine."
+  [opts]
+  (let [client-mode? (boolean (or (:client? opts) (:client-mode? opts) (= (:role opts) :client)))
+        rng (:rng opts)
+        cert-data (or (:cert-data opts) (generate-simulated-cert rng))
+        fp (:fingerprint cert-data)
+        cookie-secret (if rng (b/random-bytes 32 rng) (b/random-bytes 32))
+        client-random (if rng (b/random-bytes 32 rng) (b/random-bytes 32))
+        server-random (if rng (b/random-bytes 32 rng) (b/random-bytes 32))
+        role (if client-mode? :client :server)
+        base (map->SimulatedDtlsEngine
+              {:role role
+               :phase (if client-mode? :wait-hello-verify :wait-client-hello)
+               :local-fingerprint fp
+               :remote-fingerprint (:remote-fingerprint opts)
+               :peer-fingerprint nil
+               :cookie-secret cookie-secret
+               :client-random client-random
+               :server-random server-random
+               :epoch 0
+               :tx-seq 0
+               :rx-seq 0
+               :rx-window #{}
+               :finished? false
+               :last-flight []
+               :symmetric-key nil})]
+    (if client-mode?
+      (let [ch-body (make-client-hello-body client-random b/empty-bytes fp)
+            ch-msg (sim-make-hs-msg SIM-HS-CLIENT-HELLO 0 ch-body)
+            ch-rec (sim-make-record SIM-CONTENT-TYPE-HANDSHAKE 0 0 ch-msg)]
+        (assoc base
+               :last-flight [ch-rec]
+               :tx-seq 1))
+      base)))
 
 ;; =============================================================================
 ;; 2. Node.js (`node:crypto`) DTLS 1.2 Record & Handshake Engine (`:cljs`)
@@ -330,7 +863,9 @@
                        (js/Uint8Array. (js/Buffer.concat (into-array cs)))
                        b/empty-bytes)}))
          (catch :default _
-           {:status nil :bytes nil})))))
+           {:status nil :bytes nil})))
+     (handle-timeout [this _now-ms]
+       (handshake-step this b/empty-bytes))))
 
 #?(:cljs
    (defn- create-node-dtls-engine
@@ -1071,4 +1606,6 @@
                               (first))]
            (fingerprint cert))
          (catch Exception _
-           nil)))))
+           nil)))
+     (handle-timeout [engine _now-ms]
+       (handshake-step engine b/empty-bytes))))

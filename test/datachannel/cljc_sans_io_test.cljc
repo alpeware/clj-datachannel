@@ -89,6 +89,27 @@
              (b/bytes->hex (b/hmac-sha256 key-str msg))))
       (is (= "YWxwZXdhcmU6c2VjcmV0" (b/base64-encode (b/utf8->bytes "alpeware:secret")))))))
 
+(deftest splitmix64-cross-platform-golden-vector-test
+  (testing "SplitMix64 deterministic PRNG golden vectors for seed 0x123456789ABCDEF0 across JVM and Node.js"
+    (let [seed #?(:clj (unchecked-long 0x123456789ABCDEF0N)
+                  :cljs (js/BigInt "0x123456789ABCDEF0"))
+          rng (b/make-rng seed)
+          u64-1 (b/next-u64 rng)
+          u64-2 (b/next-u64 rng)
+          u32-1 (b/next-u32 rng)
+          u32-2 (b/next-u32 rng)
+          bs (b/next-bytes rng 8)
+          bs-vec (vec (map #(b/bget-u8 bs %) (range 8)))]
+      (is (= "161922c645ce50e8" #?(:clj (Long/toHexString u64-1)
+                                   :cljs (.toString (js/BigInt.asUintN 64 u64-1) 16))))
+      (is (= "ad760cafa1697b60" #?(:clj (Long/toHexString u64-2)
+                                   :cljs (.toString (js/BigInt.asUintN 64 u64-2) 16))))
+      (is (= "1592342178222199016" (str u64-1)))
+      (is (= "-5947552309429306528" (str u64-2)))
+      (is (= 889323332 u32-1))
+      (is (= 1098693032 u32-2))
+      (is (= [153 175 111 155 12 68 118 182] bs-vec)))))
+
 ;; =============================================================================
 ;; 2. SDP & DCEP Generative Round-Trip (`datachannel.sdp`, `datachannel.dcep`)
 ;; =============================================================================
@@ -335,6 +356,8 @@
         nil)
       (handshake-finished? [_]
         (:finished? @state-atom))
+      (handle-timeout [this _now-ms]
+        (dtls/handshake-step this (b/alloc-bytes 0)))
       (handshake-step [_ in-bytes]
         (let [in-len (b/blength in-bytes)]
           (if (zero? in-len)

@@ -73,7 +73,10 @@
   ([local-ufrag remote-ufrag remote-pwd opts]
    (let [buf (b/allocate-buffer 1024)
          _ (b/buf-set-order! buf :big-endian)
-         tx-id (or (:tx-id opts) (b/random-bytes 12))]
+         tx-id (or (:tx-id opts)
+                   (if-let [rng (:rng opts)]
+                     (b/random-bytes 12 rng)
+                     (b/random-bytes 12)))]
      ;; Header
      (put-unsigned-short buf 0x0001) ;; Binding Request
      (put-unsigned-short buf 0) ;; Length placeholder
@@ -98,7 +101,10 @@
 
      ;; ICE-CONTROLLING or ICE-CONTROLLED
      (let [role (or (:role opts) :controlled)
-           tb (long (or (:tie-breaker opts) (b/random-u64)))]
+           tb (or (:tie-breaker opts)
+                  (if-let [rng (:rng opts)]
+                    (b/random-u64 rng)
+                    (b/random-u64)))]
        (if (= role :controlling)
          (do
            (put-unsigned-short buf ATTR_ICE_CONTROLLING)
@@ -307,12 +313,12 @@
   [local-role local-tie-breaker remote-controlling? remote-controlled? remote-tie-breaker]
   (cond
     (and (= local-role :controlling) remote-controlling?)
-    (if (>= (b/compare-u64 (long (or local-tie-breaker 0)) (long (or remote-tie-breaker 0))) 0)
+    (if (>= (b/compare-u64 (or local-tie-breaker 0) (or remote-tie-breaker 0)) 0)
       {:conflict? true :error-code 487 :new-role :controlling}
       {:conflict? true :switched-role? true :new-role :controlled})
 
     (and (= local-role :controlled) remote-controlled?)
-    (if (< (b/compare-u64 (long (or local-tie-breaker 0)) (long (or remote-tie-breaker 0))) 0)
+    (if (< (b/compare-u64 (or local-tie-breaker 0) (or remote-tie-breaker 0)) 0)
       {:conflict? true :error-code 487 :new-role :controlled}
       {:conflict? true :switched-role? true :new-role :controlling})
 
