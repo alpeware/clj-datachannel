@@ -47,7 +47,7 @@
   [state app-events]
   (reassemble/reassemble state app-events))
 
-(defn- valid-verification-tag?
+(defn valid-verification-tag?
   "Checks if the incoming packet has a valid verification tag for the given state."
   [state packet]
   (let [chunks (:chunks packet)
