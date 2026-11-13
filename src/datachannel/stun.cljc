@@ -459,15 +459,46 @@
 
                   ;; Binding Response
                   (= msg-type 0x0101)
+                  (let [password (or (:remote-ice-pwd connection)
+                                     (when (:require-response-integrity? connection) (:ice-pwd connection)))
+                        require-integrity? (:require-response-integrity? connection)]
+                    (b/buf-set-position! buf start-pos)
+                    (let [parsed (parse-packet buf)
+                          attrs (:attributes parsed)
+                          has-mi? (contains? attrs ATTR_MESSAGE_INTEGRITY)]
+                      (cond
+                        (and has-mi? password (not (check-message-integrity buf start-pos msg-len password)))
+                        {:drop true :reason :invalid-message-integrity}
+
+                        (and require-integrity? (not has-mi?))
+                        {:drop true :reason :missing-message-integrity}
+
+                        :else
+                        (let [xor-addr-bytes (get attrs ATTR_XOR_MAPPED_ADDRESS)]
+                          (if xor-addr-bytes
+                            (let [decoded (decode-xor-mapped-address xor-addr-bytes cookie)
+                                  candidate-str (str (b/inet-address->str (:address decoded)) ":" (:port decoded))]
+                              {:binding-response? true :mapped-address candidate-str :candidate candidate-str})
+                            {:binding-response? true})))))
+
+                  ;; Binding Error Response
+                  (= msg-type 0x0111)
                   (do
                     (b/buf-set-position! buf start-pos)
                     (let [parsed (parse-packet buf)
-                          xor-addr-bytes (get (:attributes parsed) ATTR_XOR_MAPPED_ADDRESS)]
-                      (if xor-addr-bytes
-                        (let [decoded (decode-xor-mapped-address xor-addr-bytes cookie)
-                              candidate-str (str (b/inet-address->str (:address decoded)) ":" (:port decoded))]
-                          {:binding-response? true :mapped-address candidate-str :candidate candidate-str})
-                        {:binding-response? true})))
+                          attrs (:attributes parsed)
+                          err-bytes (get attrs ATTR_ERROR_CODE)
+                          err-code (when (and err-bytes (>= (b/blength err-bytes) 4))
+                                     (let [b2 (b/buf-get-u8! (b/wrap-buffer (b/bslice err-bytes 2 3)))
+                                           b3 (b/buf-get-u8! (b/wrap-buffer (b/bslice err-bytes 3 4)))]
+                                       (+ (* b2 100) b3)))]
+                      (if (= err-code 487)
+                        {:error-code 487
+                         :role-conflict? true
+                         :new-state (-> connection
+                                        (assoc :ice-role (if (= (:ice-role connection) :controlling) :controlled :controlling))
+                                        (update :ice-tie-breaker (fn [_] (b/next-u64 (or (:rng connection) (b/make-rng 1))))))}
+                        {:error-code err-code})))
 
                   :else
                   {})]

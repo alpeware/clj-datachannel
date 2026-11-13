@@ -372,12 +372,27 @@
                    :engine cur-engine}
                   (case (:msg-type hs)
                     ;; 1: ClientHello (Server receives)
+                    ;; 1: ClientHello (Server receives)
                     1
                     (let [{:keys [cookie client-fp client-random]} (parse-client-hello-body (:body hs))
                           client-fp-bytes (b/utf8->bytes (or client-fp ""))
                           expected-cookie (b/hmac-sha256 (:cookie-secret cur-engine)
-                                                         (b/bconcat [client-random client-fp-bytes]))]
-                      (if (and (pos? (b/blength cookie)) (b/bytes= cookie expected-cookie))
+                                                         (b/bconcat [client-random client-fp-bytes]))
+                          cur-phase (:phase cur-engine)]
+                      (cond
+                        ;; Already established: do not regress phase
+                        (= cur-phase :established)
+                        (let [last-flight (:last-flight cur-engine [])]
+                          (recur more cur-engine (into acc-packets last-flight) false))
+
+                        ;; Already waiting for client finished: retransmit server flight on duplicate ClientHello with cookie, ignore without
+                        (= cur-phase :wait-client-finished)
+                        (if (and (pos? (b/blength cookie)) (b/bytes= cookie expected-cookie))
+                          (let [last-flight (:last-flight cur-engine [])]
+                            (recur more cur-engine (into acc-packets last-flight) false))
+                          (recur more cur-engine acc-packets false))
+
+                        (and (pos? (b/blength cookie)) (b/bytes= cookie expected-cookie))
                         ;; Flight 3 -> ServerHello + Certificate + Finished (coalesced in 1 record)
                         (let [server-random (or (:server-random cur-engine) (b/random-bytes 32))
                               sh-body (make-server-hello-body server-random)
@@ -399,7 +414,9 @@
                                          :last-flight [server-rec]
                                          :tx-seq (inc tx-seq))]
                           (recur more upd (conj acc-packets server-rec) false))
+
                         ;; Flight 1 (or forged/corrupted cookie on Flight 3) -> HelloVerifyRequest
+                        :else
                         (let [hvr-body (make-hello-verify-body expected-cookie)
                               hvr-msg (sim-make-hs-msg SIM-HS-HELLO-VERIFY-REQUEST 0 hvr-body)
                               tx-seq (:tx-seq cur-engine 0)
@@ -412,17 +429,21 @@
 
                     ;; 3: HelloVerifyRequest (Client receives)
                     3
-                    (let [cookie (parse-hello-verify-body (:body hs))
-                          client-random (or (:client-random cur-engine) (b/random-bytes 32))
-                          ch-body (make-client-hello-body client-random cookie (:local-fingerprint cur-engine))
-                          ch-msg (sim-make-hs-msg SIM-HS-CLIENT-HELLO 1 ch-body)
-                          tx-seq (:tx-seq cur-engine 0)
-                          ch-rec (sim-make-record SIM-CONTENT-TYPE-HANDSHAKE 0 tx-seq ch-msg)
-                          upd (assoc cur-engine
-                                     :phase :wait-server-flight
-                                     :last-flight [ch-rec]
-                                     :tx-seq (inc tx-seq))]
-                      (recur more upd (conj acc-packets ch-rec) false))
+                    (if (or (= (:phase cur-engine) :wait-server-flight)
+                            (= (:phase cur-engine) :established))
+                      ;; Already sent ClientHello with cookie or established: ignore stale HelloVerifyRequest
+                      (recur more cur-engine acc-packets false)
+                      (let [cookie (parse-hello-verify-body (:body hs))
+                            client-random (or (:client-random cur-engine) (b/random-bytes 32))
+                            ch-body (make-client-hello-body client-random cookie (:local-fingerprint cur-engine))
+                            ch-msg (sim-make-hs-msg SIM-HS-CLIENT-HELLO 1 ch-body)
+                            tx-seq (:tx-seq cur-engine 0)
+                            ch-rec (sim-make-record SIM-CONTENT-TYPE-HANDSHAKE 0 tx-seq ch-msg)
+                            upd (assoc cur-engine
+                                       :phase :wait-server-flight
+                                       :last-flight [ch-rec]
+                                       :tx-seq (inc tx-seq))]
+                        (recur more upd (conj acc-packets ch-rec) false)))
 
                     ;; 2: ServerHello (Client receives)
                     2
@@ -467,11 +488,14 @@
                             expected-client-fin-body (make-finished-body (b/hmac-sha256 sym-key (b/utf8->bytes "client-finished")))]
                         (if-not (b/bytes= (:body hs) expected-client-fin-body)
                           {:status :handshake-failed :finished? false :packets [] :app-data nil :engine (assoc cur-engine :phase :failed)}
-                          (let [upd (assoc cur-engine
-                                           :phase :established
-                                           :epoch 1
-                                           :finished? true)]
-                            (recur more upd acc-packets true)))))
+                          (if (= (:phase cur-engine) :established)
+                            (let [last-flight (:last-flight cur-engine [])]
+                              (recur more cur-engine (into acc-packets last-flight) true))
+                            (let [upd (assoc cur-engine
+                                             :phase :established
+                                             :epoch 1
+                                             :finished? true)]
+                              (recur more upd acc-packets true))))))
 
                     (recur more cur-engine acc-packets fin?))))))))))
 
@@ -551,14 +575,16 @@
                   expected-tag (b/bslice expected-full-tag 0 16)]
               (if-not (b/bytes= tag expected-tag)
                 {:status :auth-tag-mismatch :bytes nil :engine this}
-                (let [rx-win (get this :rx-window #{})]
-                  (if (contains? rx-win seq-num)
+                (let [rx-win (get this :rx-window #{})
+                      max-seq (if (seq rx-win) (apply max rx-win) 0)
+                      new-max-seq (max max-seq seq-num)]
+                  (if (or (contains? rx-win seq-num) (< seq-num (- new-max-seq 64)))
                     {:status :replay-dropped :bytes nil :engine this}
                     {:status :ok
                      :bytes plain
                      :engine (-> this
                                  (assoc :rx-seq seq-num)
-                                 (update :rx-window (fn [w] (conj (or w #{}) seq-num))))}))))))))))
+                                 (assoc :rx-window (into #{} (filter #(>= % (- new-max-seq 64)) (conj rx-win seq-num)))))}))))))))))
 
 (defn generate-simulated-cert
   "Generates a deterministic simulated self-signed certificate data map with SHA-256 fingerprint."

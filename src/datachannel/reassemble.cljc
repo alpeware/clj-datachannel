@@ -12,7 +12,7 @@
   "Processes the receive queue of an SCTP stream according to RFC 4960, un-fragmenting and ordering inbound data chunks based on Stream Sequence Numbers and U/B/E bits."
   [stream-data]
   (let [q (:recv-queue stream-data [])
-        sorted-q (sort-by :tsn q)]
+        sorted-q (sort #(b/s32-diff (:tsn %1) (:tsn %2)) q)]
     (loop [remaining sorted-q
            current-msg []
            new-q []
@@ -30,7 +30,7 @@
             ;; Unordered
             (if (and b-bit? e-bit?)
               (recur (rest remaining)
-                     []
+                     current-msg
                      new-q
                      (conj app-events {:type :on-message :payload (:payload chunk) :stream-id (:stream-id chunk) :protocol (:protocol chunk)})
                      next-ssn)
@@ -40,16 +40,30 @@
                        new-q
                        app-events
                        next-ssn)
-                (if e-bit?
-                  (let [full-msg (conj current-msg chunk)]
-                    (recur (rest remaining)
-                           []
-                           new-q
-                           (conj app-events {:type :on-message :payload (assemble-payload full-msg) :stream-id (:stream-id chunk) :protocol (:protocol chunk)})
-                           next-ssn))
+                (if (seq current-msg)
+                  (let [last-chunk (last current-msg)
+                        expected-tsn (bit-and (inc (:tsn last-chunk)) 0xFFFFFFFF)]
+                    (if (= (:tsn chunk) expected-tsn)
+                      (if e-bit?
+                        (let [full-msg (conj current-msg chunk)]
+                          (recur (rest remaining)
+                                 []
+                                 new-q
+                                 (conj app-events {:type :on-message :payload (assemble-payload full-msg) :stream-id (:stream-id chunk) :protocol (:protocol chunk)})
+                                 next-ssn))
+                        (recur (rest remaining)
+                               (conj current-msg chunk)
+                               new-q
+                               app-events
+                               next-ssn))
+                      (recur (rest remaining)
+                             current-msg
+                             (conj new-q chunk)
+                             app-events
+                             next-ssn)))
                   (recur (rest remaining)
-                         (conj current-msg chunk)
-                         new-q
+                         current-msg
+                         (conj new-q chunk)
                          app-events
                          next-ssn))))
             ;; Ordered
@@ -59,7 +73,7 @@
                        []
                        new-q
                        (conj app-events {:type :on-message :payload (:payload chunk) :stream-id (:stream-id chunk) :protocol (:protocol chunk)})
-                       (inc next-ssn))
+                       (bit-and (inc next-ssn) 0xFFFF))
                 (if b-bit?
                   (recur (rest remaining)
                          [chunk]
@@ -73,7 +87,7 @@
                            app-events
                            next-ssn)
                     (let [last-chunk (last current-msg)
-                          expected-tsn (inc (:tsn last-chunk))]
+                          expected-tsn (bit-and (inc (:tsn last-chunk)) 0xFFFFFFFF)]
                       (if (= (:tsn chunk) expected-tsn)
                         (if e-bit?
                           (let [full-msg (conj current-msg chunk)]
@@ -81,7 +95,7 @@
                                    []
                                    new-q
                                    (conj app-events {:type :on-message :payload (assemble-payload full-msg) :stream-id (:stream-id chunk) :protocol (:protocol chunk)})
-                                   (inc next-ssn)))
+                                   (bit-and (inc next-ssn) 0xFFFF)))
                           (recur (rest remaining)
                                  (conj current-msg chunk)
                                  new-q
@@ -121,11 +135,11 @@
                                            decoded (dcep/decode-message payload)]
                                        (if (= (:type decoded) :open)
                                          (let [ack-tsn (:next-tsn st)
-                                               s2 (update st :next-tsn inc)
+                                               s2 (update st :next-tsn #(bit-and (inc (long (or % 0))) 0xFFFFFFFF))
                                                sid (:stream-id evt)
                                                ack-ssn (get-in s2 [:streams sid :next-tx-ssn] 0)
                                                s3 (-> s2
-                                                      (assoc-in [:streams sid :next-tx-ssn] (inc ack-ssn))
+                                                      (assoc-in [:streams sid :next-tx-ssn] (bit-and (inc (long ack-ssn)) 0xFFFF))
                                                       (update :ssn (fnil inc 0)))
                                                ack-chunk {:type :data
                                                           :flags 3 ;; B and E bits

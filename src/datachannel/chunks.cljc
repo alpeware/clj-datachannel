@@ -44,15 +44,15 @@
   [remote-tsn out-of-order-tsns]
   (if (empty? out-of-order-tsns)
     []
-    (let [tsns (seq out-of-order-tsns)]
+    (let [tsns (seq (into (sorted-set-by #(b/s32-diff %1 %2)) out-of-order-tsns))]
       (loop [remaining (rest tsns)
-             current-start (- (first tsns) remote-tsn)
-             current-end (- (first tsns) remote-tsn)
+             current-start (bit-and (- (first tsns) remote-tsn) 0xFFFFFFFF)
+             current-end (bit-and (- (first tsns) remote-tsn) 0xFFFFFFFF)
              blocks []]
         (if (empty? remaining)
           (conj blocks [current-start current-end])
           (let [tsn (first remaining)
-                offset (- tsn remote-tsn)]
+                offset (bit-and (- tsn remote-tsn) 0xFFFFFFFF)]
             (if (= offset (inc current-end))
               (recur (rest remaining) current-start offset blocks)
               (recur (rest remaining) offset offset (conj blocks [current-start current-end])))))))))
@@ -60,7 +60,7 @@
 (defmethod process-chunk :data [state chunk _packet now-ms]
   (let [tsn (:tsn chunk)
         remote-tsn (get state :remote-tsn -1)
-        ooo-tsns (get state :out-of-order-tsns (sorted-set))
+        ooo-tsns (get state :out-of-order-tsns (sorted-set-by #(b/s32-diff %1 %2)))
         diff (b/s32-diff tsn remote-tsn)
         is-newer? (or (= remote-tsn -1) (pos? diff))
         is-duplicate? (and (not is-newer?) (not= remote-tsn -1))]
@@ -171,23 +171,32 @@
 
 (defmethod process-chunk :cookie-echo [state chunk _packet now-ms]
   (if-let [tcb (verify-and-extract-cookie (:cookie-secret state (b/alloc-bytes 32)) (:cookie chunk))]
-    (let [interval (get state :heartbeat-interval 30000)
-          s1 (-> state
-                 (assoc :state :established
-                        :remote-ver-tag (:remote-ver-tag tcb)
-                        :remote-tsn (:remote-tsn tcb)
-                        :ssn 0
-                        :negotiated-outbound-streams (:negotiated-outbound-streams tcb)
-                        :negotiated-inbound-streams (:negotiated-inbound-streams tcb))
-                 (update :timers dissoc :sctp/t1-init)
-                 (update :timers dissoc :sctp/t1-cookie))
+    (let [was-established? (= (:state state) :established)
+          tags-match? (and (or (nil? (:local-ver-tag tcb)) (= (:local-ver-tag state) (:local-ver-tag tcb)))
+                           (or (nil? (:remote-ver-tag tcb)) (= (:remote-ver-tag state) (:remote-ver-tag tcb))))
+          interval (get state :heartbeat-interval 30000)
+          s1 (if (and was-established? tags-match?)
+               ;; RFC 4960 §5.2.4: Duplicate COOKIE-ECHO in established state with matching tags preserves active streams & remote-tsn
+               (-> state
+                   (assoc :negotiated-outbound-streams (:negotiated-outbound-streams tcb)
+                          :negotiated-inbound-streams (:negotiated-inbound-streams tcb))
+                   (update :timers dissoc :sctp/t1-init)
+                   (update :timers dissoc :sctp/t1-cookie))
+               (-> state
+                   (assoc :state :established
+                          :remote-ver-tag (:remote-ver-tag tcb)
+                          :remote-tsn (:remote-tsn tcb)
+                          :ssn 0
+                          :negotiated-outbound-streams (:negotiated-outbound-streams tcb)
+                          :negotiated-inbound-streams (:negotiated-inbound-streams tcb))
+                   (update :timers dissoc :sctp/t1-init)
+                   (update :timers dissoc :sctp/t1-cookie)))
           s2 (if (pos? interval)
                (assoc-in s1 [:timers :sctp/t-heartbeat] {:expires-at (+ now-ms interval)})
                s1)
           cookie-ack-chunk {:type :cookie-ack}
           s3 (update s2 :pending-control-chunks conj cookie-ack-chunk)
           has-buffered-data? (some #(seq (:send-queue (val %))) (:streams s3))
-          was-established? (= (:state state) :established)
           just-established? (and (not was-established?) (= (:state s3) :established))
           s4 (if (and just-established? has-buffered-data?)
                (assoc-in s3 [:timers :sctp/t3-rtx] {:expires-at (+ now-ms 1000) :delay 1000})
@@ -270,13 +279,18 @@
 
                      max-gap-tsn (if (empty? (:gap-blocks chunk))
                                    cum-tsn-ack
-                                   (+ cum-tsn-ack (second (last (:gap-blocks chunk)))))
+                                   (bit-and (+ cum-tsn-ack (second (last (:gap-blocks chunk)))) 0xFFFFFFFF))
 
                      fast-rtx-count (atom 0)
                      new-q-with-missing (mapv (fn [item]
                                                 (let [tsn (:tsn item)
-                                                      in-gap? (some (fn [[start end]] (<= (+ cum-tsn-ack start) tsn (+ cum-tsn-ack end))) (:gap-blocks chunk))]
-                                                  (if (and (:sent? item) (<= tsn max-gap-tsn) (not in-gap?))
+                                                      in-gap? (some (fn [[start end]]
+                                                                      (let [gap-start (bit-and (+ cum-tsn-ack start) 0xFFFFFFFF)
+                                                                            gap-end (bit-and (+ cum-tsn-ack end) 0xFFFFFFFF)]
+                                                                        (and (>= (b/s32-diff tsn gap-start) 0)
+                                                                             (<= (b/s32-diff tsn gap-end) 0))))
+                                                                    (:gap-blocks chunk))]
+                                                  (if (and (:sent? item) (<= (b/s32-diff tsn max-gap-tsn) 0) (not in-gap?))
                                                     (let [missing (inc (get item :missing-reports 0))
                                                           fast-rtx? (and (= missing 3) (:sent? item))]
                                                       (when fast-rtx? (swap! fast-rtx-count inc))
@@ -385,7 +399,7 @@
 (defmethod process-chunk :forward-tsn [state chunk _packet _now-ms]
   (let [new-cum-tsn (:new-cumulative-tsn chunk)
         remote-tsn (get state :remote-tsn -1)
-        ooo-tsns (get state :out-of-order-tsns (sorted-set))
+        ooo-tsns (get state :out-of-order-tsns (sorted-set-by #(b/s32-diff %1 %2)))
         diff (b/s32-diff new-cum-tsn remote-tsn)
         is-newer? (or (= remote-tsn -1) (pos? diff))]
     (if-not is-newer?
@@ -399,7 +413,7 @@
                          (update :timers dissoc :sctp/t-delayed-sack)
                          (assoc :unacked-data-chunks 0))
          :next-events []})
-      (let [pruned-ooo (into (sorted-set)
+      (let [pruned-ooo (into (sorted-set-by #(b/s32-diff %1 %2))
                              (filter #(pos? (b/s32-diff % new-cum-tsn))
                                      ooo-tsns))
             s1 (loop [curr-tsn new-cum-tsn
@@ -412,21 +426,23 @@
                          (let [cur-ssn (get-in st [:streams stream-id :next-ssn] 0)
                                target-ssn (bit-and (inc stream-sequence) 0xffff)
                                ssn-diff (b/s16-diff target-ssn cur-ssn)
-                               new-ssn (if (pos? ssn-diff) target-ssn cur-ssn)
-                               recv-q (get-in st [:streams stream-id :recv-queue] [])
-                               new-recv-q (vec (filter #(pos? (b/s32-diff (:tsn %) new-cum-tsn))
-                                                       recv-q))]
-                           (-> st
-                               (assoc-in [:streams stream-id :next-ssn] new-ssn)
-                               (assoc-in [:streams stream-id :recv-queue] new-recv-q))))
+                               new-ssn (if (pos? ssn-diff) target-ssn cur-ssn)]
+                           (assoc-in st [:streams stream-id :next-ssn] new-ssn)))
                        s1
                        (:streams chunk []))
+            s3 (reduce-kv (fn [st sid sdata]
+                            (let [recv-q (:recv-queue sdata)
+                                  new-recv-q (vec (filter #(pos? (b/s32-diff (:tsn %) new-cum-tsn))
+                                                          recv-q))]
+                              (assoc-in st [:streams sid :recv-queue] new-recv-q)))
+                          s2
+                          (:streams s2))
             sack-chunk {:type :sack
-                        :cum-tsn-ack (:remote-tsn s2)
-                        :a-rwnd (get s2 :a-rwnd 262144)
-                        :gap-blocks (compute-gap-blocks (:remote-tsn s2) (:out-of-order-tsns s2))
+                        :cum-tsn-ack (:remote-tsn s3)
+                        :a-rwnd (get s3 :a-rwnd 262144)
+                        :gap-blocks (compute-gap-blocks (:remote-tsn s3) (:out-of-order-tsns s3))
                         :duplicate-tsns []}]
-        {:next-state (-> s2
+        {:next-state (-> s3
                          (update :pending-control-chunks conj sack-chunk)
                          (update :timers dissoc :sctp/t-delayed-sack)
                          (assoc :unacked-data-chunks 0))

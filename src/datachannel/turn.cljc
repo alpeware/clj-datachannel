@@ -841,8 +841,13 @@
                    (#{401 438} (:error-code parsed))
                    (:realm parsed)
                    (:nonce parsed))
-              (let [retries (long (or (:auth-retries client-state) 0))
-                    max-retries (long (or (:max-auth-retries client-state) 1))
+              (let [is-438? (= 438 (:error-code parsed))
+                    retries (long (if is-438?
+                                    (or (:stale-nonce-retries client-state) 0)
+                                    (or (:auth-retries client-state) 0)))
+                    max-retries (long (if is-438?
+                                        (or (:max-stale-nonce-retries client-state) 3)
+                                        (or (:max-auth-retries client-state) 1)))
                     act (:action pending)]
                 (if (and (#{:allocate :allocate-auth :refresh :create-permission :channel-bind nil} act)
                          (< retries max-retries))
@@ -863,33 +868,34 @@
                           :create-permission
                           (let [pa (:peer-addr pending)]
                             [(make-create-permission-request user realm pass nonce pa {:tx-id retry-tx-id :rng (:rng client-state)})
-                             {:action :create-permission :peer-addr pa}
+                             {:action :create-permission :peer-addr pa :sent-at-ms now}
                              (:state client-state)])
 
                           :channel-bind
                           (let [ch (:channel-number pending)
                                 pa (:peer-addr pending)]
                             [(make-channel-bind-request user realm pass nonce ch pa {:tx-id retry-tx-id :rng (:rng client-state)})
-                             {:action :channel-bind :channel-number ch :peer-addr pa}
+                             {:action :channel-bind :channel-number ch :peer-addr pa :sent-at-ms now}
                              (:state client-state)])
 
                           [(make-allocate-request user realm pass nonce {:tx-id retry-tx-id :rng (:rng client-state) :lifetime (:lifetime client-state)})
-                           {:action :allocate-auth}
+                           {:action :allocate-auth :sent-at-ms now}
                            :allocating-authenticated])]
                     {:new-state (-> new-client-state
                                     (assoc :state next-st
                                            :realm realm
-                                           :nonce nonce
-                                           :auth-retries (inc retries))
+                                           :nonce nonce)
+                                    (cond-> is-438? (assoc :stale-nonce-retries (inc retries))
+                                            (not is-438?) (assoc :auth-retries (inc retries)))
                                     (assoc-in [:pending-tx retry-tx-k] retry-pending))
                      :network-out [retry-pkt]
                      :events [{:type :turn-challenge-retry :realm realm :nonce nonce :action (or act :allocate)}]})
                   {:new-state (assoc new-client-state
                                      :state :error
-                                     :last-error :turn-auth-retry-exhausted)
+                                     :last-error (if is-438? :turn-stale-nonce-retry-exhausted :turn-auth-retry-exhausted))
                    :network-out []
                    :events [{:type :turn-error
-                             :reason :turn-auth-retry-exhausted
+                             :reason (if is-438? :turn-stale-nonce-retry-exhausted :turn-auth-retry-exhausted)
                              :error-code (:error-code parsed)
                              :msg-type msg-type}]}))
 
@@ -918,25 +924,29 @@
                   {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
                    :network-out []
                    :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
-                  (let [lt (long (or (:lifetime parsed) (:lifetime client-state) 600))
-                        exp-at (+ now (* lt 1000))
-                        ref-at (+ now (* (long (* lt 0.8)) 1000))
-                        st (assoc new-client-state
-                                  :state :allocated
-                                  :auth-retries 0
-                                  :relayed-address (:relayed-address parsed)
-                                  :mapped-address (:mapped-address parsed)
-                                  :lifetime lt
-                                  :allocated-at-ms now
-                                  :expires-at-ms exp-at
-                                  :refresh-at-ms ref-at)]
-                    {:new-state st
+                  (if (nil? pending)
+                    {:new-state client-state
                      :network-out []
-                     :events [{:type :turn-allocated
-                               :relayed-address (:relayed-address parsed)
-                               :lifetime lt
-                               :expires-at-ms exp-at
-                               :refresh-at-ms ref-at}]})))
+                     :events [{:type :turn-packet-dropped :reason :unknown-transaction-id}]}
+                    (let [lt (long (or (:lifetime parsed) (:lifetime client-state) 600))
+                          exp-at (+ now (* lt 1000))
+                          ref-at (+ now (* (long (* lt 0.8)) 1000))
+                          st (assoc new-client-state
+                                    :state :allocated
+                                    :auth-retries 0
+                                    :relayed-address (:relayed-address parsed)
+                                    :mapped-address (:mapped-address parsed)
+                                    :lifetime lt
+                                    :allocated-at-ms now
+                                    :expires-at-ms exp-at
+                                    :refresh-at-ms ref-at)]
+                      {:new-state st
+                       :network-out []
+                       :events [{:type :turn-allocated
+                                 :relayed-address (:relayed-address parsed)
+                                 :lifetime lt
+                                 :expires-at-ms exp-at
+                                 :refresh-at-ms ref-at}]}))))
 
               (= msg-type METHOD_CREATE_PERMISSION_RESPONSE)
               (let [valid-mi? (if (and (:username client-state) (:realm client-state) (:password client-state))
@@ -946,14 +956,18 @@
                   {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
                    :network-out []
                    :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
-                  (let [peer-addr (:peer-addr pending)
-                        ip (when peer-addr (peer-ip peer-addr))
-                        st (-> new-client-state
-                               (assoc :auth-retries 0)
-                               (update :permissions (fnil conj #{}) (or ip (str peer-addr))))]
-                    {:new-state st
+                  (if (nil? pending)
+                    {:new-state client-state
                      :network-out []
-                     :events [{:type :turn-permission-created :peer-address peer-addr}]})))
+                     :events [{:type :turn-packet-dropped :reason :unknown-transaction-id}]}
+                    (let [peer-addr (:peer-addr pending)
+                          ip (when peer-addr (peer-ip peer-addr))
+                          st (-> new-client-state
+                                 (assoc :auth-retries 0)
+                                 (update :permissions (fnil conj #{}) (or ip (str peer-addr))))]
+                      {:new-state st
+                       :network-out []
+                       :events [{:type :turn-permission-created :peer-address peer-addr}]}))))
 
               (= msg-type METHOD_CHANNEL_BIND_RESPONSE)
               (let [valid-mi? (if (and (:username client-state) (:realm client-state) (:password client-state))
@@ -963,18 +977,22 @@
                   {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
                    :network-out []
                    :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
-                  (let [ch (:channel-number pending)
-                        peer-addr (:peer-addr pending)
-                        ip (when peer-addr (peer-ip peer-addr))
-                        st (-> new-client-state
-                               (assoc :state :channel-bound :auth-retries 0)
-                               (assoc-in [:channels ch] peer-addr)
-                               (assoc-in [:peer->channel (str peer-addr)] ch)
-                               (cond-> ip (assoc-in [:peer->channel ip] ch))
-                               (update :permissions (fnil conj #{}) (or ip (str peer-addr))))]
-                    {:new-state st
+                  (if (nil? pending)
+                    {:new-state client-state
                      :network-out []
-                     :events [{:type :turn-channel-bound :channel-number ch :peer-address peer-addr}]})))
+                     :events [{:type :turn-packet-dropped :reason :unknown-transaction-id}]}
+                    (let [ch (:channel-number pending)
+                          peer-addr (:peer-addr pending)
+                          ip (when peer-addr (peer-ip peer-addr))
+                          st (-> new-client-state
+                                 (assoc :state :channel-bound :auth-retries 0)
+                                 (assoc-in [:channels ch] peer-addr)
+                                 (assoc-in [:peer->channel (str peer-addr)] ch)
+                                 (cond-> ip (assoc-in [:peer->channel ip] ch))
+                                 (update :permissions (fnil conj #{}) (or ip (str peer-addr))))]
+                      {:new-state st
+                       :network-out []
+                       :events [{:type :turn-channel-bound :channel-number ch :peer-address peer-addr}]}))))
 
               (= msg-type METHOD_REFRESH_RESPONSE)
               (let [valid-mi? (if (and (:username client-state) (:realm client-state) (:password client-state))
@@ -984,22 +1002,26 @@
                   {:new-state (assoc new-client-state :state :error :last-error :turn-auth-failed)
                    :network-out []
                    :events [{:type :turn-auth-failed :reason :invalid-message-integrity}]}
-                  (let [lt (long (or (:lifetime parsed) 0))
-                        exp-at (if (zero? lt) now (+ now (* lt 1000)))
-                        ref-at (if (zero? lt) nil (+ now (* (long (* lt 0.8)) 1000)))
-                        st (assoc new-client-state
-                                  :auth-retries 0
-                                  :lifetime lt
-                                  :allocated-at-ms (if (zero? lt) (:allocated-at-ms new-client-state) now)
-                                  :expires-at-ms exp-at
-                                  :refresh-at-ms ref-at
-                                  :state (if (zero? lt) :closed (:state new-client-state)))]
-                    {:new-state st
+                  (if (nil? pending)
+                    {:new-state client-state
                      :network-out []
-                     :events [{:type (if (zero? lt) :turn-closed :turn-refreshed)
-                               :lifetime lt
-                               :expires-at-ms exp-at
-                               :refresh-at-ms ref-at}]})))
+                     :events [{:type :turn-packet-dropped :reason :unknown-transaction-id}]}
+                    (let [lt (long (or (:lifetime parsed) 0))
+                          exp-at (if (zero? lt) now (+ now (* lt 1000)))
+                          ref-at (if (zero? lt) nil (+ now (* (long (* lt 0.8)) 1000)))
+                          st (assoc new-client-state
+                                    :auth-retries 0
+                                    :lifetime lt
+                                    :allocated-at-ms (if (zero? lt) (:allocated-at-ms new-client-state) now)
+                                    :expires-at-ms exp-at
+                                    :refresh-at-ms ref-at
+                                    :state (if (zero? lt) :closed (:state new-client-state)))]
+                      {:new-state st
+                       :network-out []
+                       :events [{:type (if (zero? lt) :turn-closed :turn-refreshed)
+                                 :lifetime lt
+                                 :expires-at-ms exp-at
+                                 :refresh-at-ms ref-at}]}))))
 
               (= msg-type METHOD_DATA_INDICATION)
               (let [peer (:peer-address parsed)

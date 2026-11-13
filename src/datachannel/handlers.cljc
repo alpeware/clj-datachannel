@@ -12,6 +12,28 @@
   [cand]
   (b/to-socket-address cand))
 
+(defn valid-verification-tag?
+  "Checks if the incoming packet has a valid verification tag for the given state per RFC 4960 §8.5."
+  ([state packet]
+   (valid-verification-tag? state packet (first (:chunks packet))))
+  ([state packet first-chunk]
+   (let [packet-vtag (long (or (:verification-tag packet) 0))
+         local-vtag (long (or (:local-ver-tag state) 0))
+         fallback-vtag (long (or (:init-tag state) 0))
+         c-type (:type first-chunk)]
+     (cond
+       (= c-type :init)
+       (zero? packet-vtag)
+
+       (and (pos? local-vtag) (some? (:verification-tag packet)))
+       (or (= packet-vtag local-vtag)
+           (and (pos? fallback-vtag) (= packet-vtag fallback-vtag)))
+
+       :else
+       (or (= packet-vtag local-vtag)
+           (and (not (zero? fallback-vtag)) (= packet-vtag fallback-vtag))
+           (and (zero? local-vtag) (zero? fallback-vtag)))))))
+
 (defn wrap-turn-packets
   "Targets TURN control packets to `turn-server-addr` when configured."
   [packets turn-server-addr]
@@ -157,9 +179,13 @@
                :app-events [{:type :on-error :cause :max-retransmissions} {:type :on-close}]}))
           (let [new-delay (* (:delay timer) 2)
                 new-delay (min new-delay 60000)
-                ;; Mark sent? false so packetize will re-transmit it
-                updated-item (assoc first-item :retries (inc retries) :sent? false)
-                new-q (assoc q 0 updated-item)
+                ;; Mark sent? false on ALL unacknowledged in-flight items so packetize will retransmit them
+                new-q (mapv (fn [idx item]
+                              (if (:sent? item)
+                                (cond-> (assoc item :sent? false)
+                                  (zero? idx) (update :retries (fnil inc 0)))
+                                item))
+                            (range) q)
 
                 ;; CC backoff
                 cwnd (get state :cwnd 1000000)
@@ -167,15 +193,15 @@
                 new-ssthresh (max (quot cwnd 2) (* 4 mtu))
                 new-cwnd (* 1 mtu)
 
-                ;; flight-size logic: decrease flight-size because we mark it sent?=false
-                chunk-size (+ 16 (b/blength (:payload (:chunk first-item))))
-                flight-size (max 0 (- (get state :flight-size 0) chunk-size))]
+                ;; flight-size logic: decrease flight-size because in-flight chunks are marked sent?=false
+                in-flight-bytes (reduce + (map (fn [item] (if (:sent? item) (+ 16 (b/blength (:payload (:chunk item)))) 0)) q))
+                flight-size (max 0 (- (get state :flight-size 0) in-flight-bytes))]
             {:new-state (-> state
                             (assoc-in [:timers :sctp/t3-rtx] {:expires-at (+ now-ms new-delay) :delay new-delay})
                             (update-in [:metrics :retransmissions] (fnil inc 0))
                             (assoc-in [:streams stream-id :send-queue] new-q)
                             (assoc :ssthresh new-ssthresh)
-                            (assoc :cwnd (max new-cwnd (+ flight-size chunk-size)))
+                            (assoc :cwnd new-cwnd)
                             (assoc :flight-size flight-size))
              :app-events []}))))))
 
